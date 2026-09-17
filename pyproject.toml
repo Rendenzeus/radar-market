@@ -1,0 +1,26 @@
+[project]
+name = "market-radar"
+version = "1.0.0"
+description = "Live XAU and BTC technical signal dashboard with automatic market analysis."
+requires-python = ">=3.12"
+authors = [
+    { name = "Rendenzeus", email = "m.rendy.putra@gmail.com" }
+]
+dependencies = [
+    "flet"
+]
+
+[dependency-groups]
+dev = [
+    "flet-cli",
+    "flet-desktop",
+    "flet-web"
+]
+
+[tool.flet.metadata]
+title = "Market Radar"
+
+[tool.flet]
+org = "dev.flet"
+company = "Rendenzeus"
+copyright = "Copyright (C) 2026 by Rendenzeus"
