@@ -1,4 +1,1 @@
 flet
-yfinance
-pandas
-requests
