@@ -424,8 +424,8 @@ class MarketCard(ft.Container):
         else:
             icon, icolor = ft.Icons.SCHEDULE, MUTED
             text = (
-                f"Menunggu breakout: BUY bila close candle {tf} di atas high {ENTRY_N} candle dan di atas EMA200, "
-                f"SELL bila di bawah low {ENTRY_N} candle dan di bawah EMA200."
+                f"Menunggu breakout: BUY bila close candle {tf} di atas high {ENTRY_N} candle dan di atas EMA200. "
+                "Tidak ada sinyal SELL (v3): di 2023–2026 posisi SELL rugi di semua teknik yang diuji."
             )
         if closed:
             icon, icolor = ft.Icons.NIGHTLIGHT_ROUND, MUTED

@@ -1,6 +1,7 @@
-"""Signal v2: Donchian breakout with a trend filter on large timeframes.
+"""Signal v3 = v2 long-only: Donchian breakout with a trend filter on large timeframes.
 
-Spec (fixed before testing, see docs/signal-v2.md):
+The app runs v3 (docs/signal-v3.md): the v2 rules below with ALLOW_SHORT = False.
+v2 spec (fixed before testing, see docs/signal-v2.md):
   long  when close > highest high of the previous 20 candles and close > EMA200
   short when close < lowest low  of the previous 20 candles and close < EMA200
   entry at the close of the breakout candle
@@ -31,6 +32,8 @@ TREND_EMA = 200
 STOP_ATR = 2.0
 EVAL_WINDOW = 900  # candles for the context score
 PAPER_MIN_TRADES = 30
+VERSION = 3
+ALLOW_SHORT = False  # v3: SELL lost money in every tested technique on 2023-2026 crypto
 
 SIGNAL_TIMEFRAMES_TEXT = {14400: "4 jam dan 1 hari", 86400: "1 hari"}
 
@@ -164,7 +167,7 @@ class SignalEngine:
             self.last_eval = evaluate(closed[-EVAL_WINDOW:], self.tf)
         st = SignalState(disabled=self.disabled, last_t=closed[-1].t, bars=len(closed))
         if not self.disabled:
-            trades, plan = run_strategy(closed, self.cost_pct)
+            trades, plan = run_strategy(closed, self.cost_pct, allow_short=ALLOW_SHORT)
             st.history, st.plan = trades, plan
             st.label = "WAIT" if plan is None else ("BUY" if plan.direction > 0 else "SELL")
             self._log_live(trades, plan)
@@ -206,7 +209,7 @@ class SignalEngine:
             # True when the event was written more than one candle after it happened
             # (app was shut): the rule is the same, but nobody could have acted on it live.
             "backfilled": now - happened > self.tf.seconds,
-            "version": 2,
+            "version": VERSION,
             **fields,
             "net_r": net_r,
         }
@@ -220,24 +223,26 @@ class SignalEngine:
 
 
 def _rows(path: Path) -> list[dict]:
+    """Journal rows of the current signal version (rows without a version are v2)."""
     try:
-        return [json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
+        rows = [json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
     except Exception:
         return []
+    return [r for r in rows if r.get("version", 2) == VERSION]
 
 
 def paper_start(path: Path) -> float:
-    """Time paper trading started. Written to the journal once and never changed."""
-    rows = _rows(path)
-    for r in rows:
+    """Time paper trading of the current version started. Written once, never changed.
+
+    Older versions' rows stay in the file; a new version starts its own record."""
+    for r in _rows(path):
         if r.get("event") == "start":
             return float(r["t"])
-    # A journal from before this field existed: start at its first entry.
-    t = min((r["logged_at"] for r in rows if "logged_at" in r), default=int(time.time()))
+    t = int(time.time())
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"event": "start", "t": t, "version": 2}, separators=(",", ":")) + "\n")
+            fh.write(json.dumps({"event": "start", "t": t, "version": VERSION}, separators=(",", ":")) + "\n")
     except Exception:
         pass
     return float(t)
@@ -269,7 +274,7 @@ def paper_text(summary: dict) -> str:
     since = time.strftime("%d %b %Y", time.localtime(summary["start"]))
     name = lambda r: f"{r['symbol'].replace('USDT', '')} {r['tf']} {'BUY' if r['direction'] > 0 else 'SELL'}"  # noqa: E731
     opened = summary["open"]
-    parts = [f"Paper trading sejak {since} (5 kripto di 4 jam & 1 hari, Gold di 1 hari)"]
+    parts = [f"Paper trading v3 (BUY saja) sejak {since}: 5 kripto di 4 jam & 1 hari, Gold di 1 hari"]
     parts.append(f"{len(opened)} posisi terbuka" + (f" ({', '.join(name(r) for r in opened)})" if opened else ""))
     n = summary["trades"]
     if n:
@@ -283,7 +288,7 @@ def paper_text(summary: dict) -> str:
 
 
 def _key(r: dict) -> tuple:
-    return r.get("event"), r.get("symbol"), r.get("tf"), r.get("opened_t")
+    return r.get("event"), r.get("symbol"), r.get("tf"), r.get("opened_t"), r.get("version", 2)
 
 
 def _already_logged(path: Path, row: dict) -> bool:
@@ -298,10 +303,7 @@ def _already_logged(path: Path, row: dict) -> bool:
 
 def journal_stats(path: Path, symbol: str, tf_key: str) -> tuple[int, int, float]:
     """(trades, wins, average net R) of live-logged closed trades."""
-    try:
-        rows = [json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
-    except Exception:
-        return 0, 0, 0.0
+    rows = _rows(path)
     net = [r["net_r"] for r in rows if r.get("event") == "close" and r.get("symbol") == symbol and r.get("tf") == tf_key]
     if not net:
         return 0, 0, 0.0

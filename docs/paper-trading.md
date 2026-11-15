@@ -5,7 +5,7 @@ dan menulis jurnal append-only: satu baris JSON per kejadian, tidak pernah ditul
 
 | Jalur | Pasar | Eksekusi | Jurnal |
 |---|---|---|---|
-| App (dashboard) | 5 kripto 4h/1D, Gold 1D | Harga close candle sinyal, tanpa fill | `<data app>/journal.jsonl` |
+| App (dashboard), sinyal v3 BUY saja | 5 kripto 4h/1D, Gold 1D | Harga close candle sinyal, tanpa fill | `<data app>/journal.jsonl` |
 | `tools/binance_paper.py` | **Uji v3** ([signal-v3.md](signal-v3.md)): BTC, ETH, BNB, SOL, XRP 4h/1D, BUY saja | Simulasi fill di bid/ask live Binance + fee 0,1%/sisi | `~/.market-radar/binance_paper.jsonl` |
 | `tools/mt5_paper.py` | XAUUSD 4h/1D | Order asli di akun demo MT5 (lihat [mt5.md](mt5.md)) | `~/.market-radar/mt5_paper.jsonl` |
 

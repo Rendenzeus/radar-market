@@ -108,7 +108,7 @@ class JournalTests(unittest.TestCase):
             path = Path(tmp) / "journal.jsonl"
             c = rising(230)
             c.append(bar(c[-1], 329, 329.5, 300, 301))
-            path.write_text(json.dumps({"event": "start", "t": c[150].t}) + "\n", "utf-8")
+            path.write_text(json.dumps({"event": "start", "t": c[150].t, "version": 3}) + "\n", "utf-8")
             # the app only opens after the trade has already opened and closed
             for _ in range(2):  # two sessions: nothing is written twice
                 SignalEngine(TIMEFRAMES["4h"], path, "TEST").update(c)
@@ -124,10 +124,30 @@ class JournalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "journal.jsonl"
             c = rising(230)
-            path.write_text(json.dumps({"event": "start", "t": c[150].t}) + "\n", "utf-8")
+            path.write_text(json.dumps({"event": "start", "t": c[150].t, "version": 3}) + "\n", "utf-8")
             SignalEngine(TIMEFRAMES["4h"], path, "TEST").update(c)
             s = paper_summary(path)
             self.assertEqual((s["trades"], len(s["open"]), s["open"][0]["direction"]), (0, 1, 1))
+
+
+    def test_v2_rows_do_not_count_in_the_v3_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "journal.jsonl"
+            old = [{"event": "start", "t": 1, "version": 2},
+                   {"event": "open", "symbol": "X", "tf": "4h", "opened_t": 5, "direction": -1, "version": 2},
+                   {"event": "close", "symbol": "X", "tf": "4h", "opened_t": 5, "net_r": -1.0, "version": 2}]
+            path.write_text("".join(json.dumps(r) + "\n" for r in old), "utf-8")
+            self.assertGreater(paper_start(path), 1)  # v3 starts its own record
+            s = paper_summary(path)
+            self.assertEqual((s["trades"], s["open"]), (0, []))
+
+
+class LongOnlyTests(unittest.TestCase):
+    def test_app_engine_never_sells(self):
+        c = [Candle(i * 4 * 3600, 500 - i, 500.5 - i, 499.5 - i, 500 - i, 1) for i in range(260)]
+        st = SignalEngine(TIMEFRAMES["4h"]).update(c)
+        self.assertEqual((st.label, st.plan, st.history), ("WAIT", None, []))
+        self.assertIsNotNone(run_strategy(c)[1])  # v2 rules with shorts would be in a SELL here
 
 
 class PaperFeedTests(unittest.TestCase):

@@ -59,11 +59,12 @@ class MarketDashboard(ft.Column):
             ft.Text(
                 "Analisis teknikal edukatif, bukan rekomendasi finansial. Gold memakai harga futures COMEX "
                 "(GC=F) dari Yahoo yang bisa tertunda ±10 menit; BTC real-time dari Binance. "
-                "Sinyal v2: breakout 20 candle searah EMA200, stop 2× ATR terkunci, keluar trailing 10 candle, "
+                "Sinyal v3: BUY saja saat breakout 20 candle di atas EMA200, stop 2× ATR terkunci, keluar trailing 10 candle, "
                 "hanya di 4 jam/1 hari (Gold 1 hari), dari candle close. Skor 0–100 hanya konteks. "
-                "Uji holdout 2023–2026 (5 kripto, 4 jam, setelah biaya): +0,24R per trade dan lulus syarat yang ditetapkan "
-                "sebelum uji, tapi buktinya tipis: koin saling berkorelasi, hasil 2025–2026 lebih lemah, posisi SELL rugi. "
-                "Tahap berikutnya paper trading, bukan uang sungguhan. Detail: docs/backtest.md.",
+                "Backtest 5 kripto 4 jam 2023–2026 (BUY saja, setelah biaya): +0,54R per trade, tapi melemah tiap tahun "
+                "dan untungnya bergantung pada sedikit trade besar. v3 sedang diuji ke depan (paper trading) dengan "
+                "syarat lulus dan batas rugi 50R yang ditulis sebelum mulai. Bukan untuk uang sungguhan. "
+                "Detail: docs/signal-v3.md.",
                 size=11,
                 color=MUTED,
             ),
