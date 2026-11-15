@@ -30,6 +30,7 @@ EXIT_N = 10
 TREND_EMA = 200
 STOP_ATR = 2.0
 EVAL_WINDOW = 900  # candles for the context score
+PAPER_MIN_TRADES = 30
 
 SIGNAL_TIMEFRAMES_TEXT = {14400: "4 jam dan 1 hari", 86400: "1 hari"}
 
@@ -150,7 +151,9 @@ class SignalEngine:
         self.last_eval: Evaluation | None = None
         self._journal = journal
         self._symbol = symbol
-        self._started = time.time()
+        # Paper trading starts once (first run) and is stored in the journal, so trades
+        # that open or close while the app is shut are still recorded on the next run.
+        self._started = paper_start(journal) if journal is not None else time.time()
         self._logged: set[tuple] = set()
 
     def update(self, closed: list[Candle]) -> SignalState:
@@ -170,15 +173,17 @@ class SignalEngine:
 
     # ------------------------------------------------------------ journal
     def _is_live(self, t: int) -> bool:
-        """True for an event on a candle that closed after the app started."""
+        """True for an event on a candle that closed after paper trading started."""
         return t + self.tf.seconds >= self._started
 
     def _log_live(self, trades: list[TradePlan], plan: TradePlan | None) -> None:
+        """Record every trade opened since the paper start, including ones missed while the app was shut."""
+        for p in trades:
+            if self._is_live(p.opened_t):
+                self._append("open", p)
+                self._append("close", p)
         if plan is not None and self._is_live(plan.opened_t):
             self._append("open", plan)
-        for p in trades:
-            if self._is_live(p.closed_t):
-                self._append("close", p)
 
     def _append(self, event: str, plan: TradePlan) -> None:
         """Append-only log, one JSON object per line, each event written once."""
@@ -186,14 +191,24 @@ class SignalEngine:
         if self._journal is None or key in self._logged:
             return
         self._logged.add(key)
+        fields = asdict(plan)
+        net_r = plan.net_r
+        happened = (plan.closed_t if event == "close" else plan.opened_t) + self.tf.seconds
+        if event == "open":  # the row describes the trade as it was at entry
+            fields.update(status="OPEN", closed_t=None, exit_price=None, exit_reason=None, result_r=None)
+            net_r = None
+        now = int(time.time())
         row = {
             "event": event,
             "symbol": self._symbol,
             "tf": self.tf.key,
-            "logged_at": int(time.time()),
+            "logged_at": now,
+            # True when the event was written more than one candle after it happened
+            # (app was shut): the rule is the same, but nobody could have acted on it live.
+            "backfilled": now - happened > self.tf.seconds,
             "version": 2,
-            **asdict(plan),
-            "net_r": plan.net_r,
+            **fields,
+            "net_r": net_r,
         }
         try:
             self._journal.parent.mkdir(parents=True, exist_ok=True)
@@ -202,6 +217,69 @@ class SignalEngine:
                     fh.write(json.dumps(row, separators=(",", ":")) + "\n")
         except Exception:
             pass
+
+
+def _rows(path: Path) -> list[dict]:
+    try:
+        return [json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
+def paper_start(path: Path) -> float:
+    """Time paper trading started. Written to the journal once and never changed."""
+    rows = _rows(path)
+    for r in rows:
+        if r.get("event") == "start":
+            return float(r["t"])
+    # A journal from before this field existed: start at its first entry.
+    t = min((r["logged_at"] for r in rows if "logged_at" in r), default=int(time.time()))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"event": "start", "t": t, "version": 2}, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+    return float(t)
+
+
+def paper_summary(path: Path) -> dict:
+    """Whole paper record: start time, open positions, closed trades (net R), missed count."""
+    rows = _rows(path)
+    start = next((float(r["t"]) for r in rows if r.get("event") == "start"), None)
+    ident = lambda r: (r.get("symbol"), r.get("tf"), r.get("opened_t"))  # noqa: E731
+    opened = {ident(r): r for r in rows if r.get("event") == "open"}
+    closed = [r for r in rows if r.get("event") == "close" and ident(r) in opened]
+    done = {ident(r) for r in closed}
+    net = [r["net_r"] for r in closed]
+    return {
+        "start": start,
+        "open": [r for k, r in opened.items() if k not in done],
+        "trades": len(net),
+        "wins": sum(1 for x in net if x > 0),
+        "total_r": sum(net),
+        "missed": sum(1 for r in opened.values() if r.get("backfilled")),
+    }
+
+
+def paper_text(summary: dict) -> str:
+    """One line for the dashboard. Never shows an average on a small sample."""
+    if not summary.get("start"):
+        return "Paper trading belum mulai."
+    since = time.strftime("%d %b %Y", time.localtime(summary["start"]))
+    name = lambda r: f"{r['symbol'].replace('USDT', '')} {r['tf']} {'BUY' if r['direction'] > 0 else 'SELL'}"  # noqa: E731
+    opened = summary["open"]
+    parts = [f"Paper trading sejak {since} (5 kripto di 4 jam & 1 hari, Gold di 1 hari)"]
+    parts.append(f"{len(opened)} posisi terbuka" + (f" ({', '.join(name(r) for r in opened)})" if opened else ""))
+    n = summary["trades"]
+    if n:
+        parts.append(f"{n} trade selesai, {summary['wins']} untung, total {summary['total_r']:+.1f}R bersih")
+    else:
+        parts.append("belum ada trade selesai")
+    if summary["missed"]:
+        parts.append(f"{summary['missed']} entry tercatat belakangan (app tertutup saat sinyal muncul)")
+    tail = "" if n >= PAPER_MIN_TRADES else f" Terlalu sedikit untuk dinilai (butuh ≥ {PAPER_MIN_TRADES} trade); pakai ini untuk melatih eksekusi, bukan membuktikan sinyal."
+    return " · ".join(parts) + "." + tail
 
 
 def _key(r: dict) -> tuple:

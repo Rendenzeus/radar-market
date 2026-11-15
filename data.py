@@ -140,6 +140,8 @@ class Feed:
     # Shortest timeframe with enough history to test the signal; below it the
     # app shows the chart but issues no trade signals.
     min_signal_seconds: int = 0
+    # Timeframes the signal runs on; the paper-trading loop follows all of them.
+    signal_timeframes: tuple[str, ...] = ()
     default_timeframe: str = DEFAULT_TIMEFRAME
 
     def fetch(self, tf: Timeframe, full: bool) -> tuple[list[Candle], Quote]:
@@ -169,6 +171,7 @@ class BinanceFeed(Feed):
         self.cost_pct = 2 * (0.0010 + 0.0003)
         self.cost_note = "biaya 0,1%/sisi + slippage 0,03%/sisi"
         self.min_signal_seconds = 4 * 3600
+        self.signal_timeframes = ("4h", "1d")
         self.default_timeframe = "4h"
         self.refresh_seconds = 3
         self._host = self.HOSTS[0]
@@ -253,6 +256,7 @@ class YahooFeed(Feed):
         # Yahoo keeps only ~60 days of 15m/30m bars and ~730 days of 1h bars; the
         # signal is tested on daily bars only.
         self.min_signal_seconds = 86400
+        self.signal_timeframes = ("1d",)
         self.default_timeframe = "1d"
 
     def recent_window(self, tf: Timeframe) -> float:
@@ -377,4 +381,13 @@ def default_cache_dir() -> Path:
 FEEDS: tuple[Feed, ...] = (
     YahooFeed("GC=F", "Gold Futures", "GC", "COMEX GC=F · Yahoo · bukan harga spot"),
     BinanceFeed("BTCUSDT", "Bitcoin", "BTC"),
+)
+
+# Followed in the background for paper trading only (no card): the other four coins
+# of the holdout test, so the paper record covers the same markets as the backtest.
+PAPER_FEEDS: tuple[Feed, ...] = (
+    BinanceFeed("ETHUSDT", "Ethereum", "ETH"),
+    BinanceFeed("BNBUSDT", "BNB", "BNB"),
+    BinanceFeed("SOLUSDT", "Solana", "SOL"),
+    BinanceFeed("XRPUSDT", "XRP", "XRP"),
 )

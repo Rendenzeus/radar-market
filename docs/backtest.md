@@ -58,9 +58,17 @@ Arahnya konsisten positif, tapi di 1D dan Gold jumlah trade terlalu sedikit untu
 
 ### Langkah berikutnya
 
-Paper trading 6–8 minggu. App menulis tiap entry dan exit yang terjadi setelah app dibuka
-ke `journal.jsonl` (append-only, satu baris per kejadian, ada waktu pencatatan, tidak
-pernah ditulis ulang). Hasilnya harus masuk rentang backtest sebelum uang kecil dipakai.
+Paper trading. Tanggal mulai ditulis sekali di baris pertama `journal.jsonl` dan tidak
+pernah berubah. App mengikuti kelima koin holdout (BTC, ETH, BNB, SOL, XRP) di 4h dan 1D
+serta Gold di 1D di latar belakang, apa pun yang sedang tampil di kartu, dan mencatat semua
+trade yang dibuka sejak tanggal mulai. Trade yang terjadi saat app tertutup dicatat saat
+app dibuka lagi dengan tanda `backfilled: true` (aturannya sama, tapi tidak mungkin
+dieksekusi langsung). Jurnal append-only, satu baris per kejadian, ada waktu pencatatan.
+
+Paper trading 6–8 minggu hanya menghasilkan ±30–40 trade, terlalu sedikit untuk
+membuktikan atau membantah +0,24R (hasil holdout bergantung pada ±10 trade besar dari 932).
+Gunanya menguji eksekusi: apakah entry bisa diikuti tepat waktu dan rentetan kalah bisa
+ditahan. Bukti keunggulan harus datang dari data baru (v3 di koin lain atau waktu ke depan).
 
 Mengulang: `python tools/backtest_trend.py` (unduh ±20.000 candle per koin, ±10 menit).
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from data import TIMEFRAMES, BinanceFeed, Candle, YahooFeed
-from signals import SignalEngine, engine_for, run_strategy
+from signals import SignalEngine, engine_for, paper_start, paper_summary, run_strategy
 
 
 def rising(n=230, step=4 * 3600):
@@ -80,21 +80,66 @@ class GateTests(unittest.TestCase):
             self.check(gold, key, off)
 
 
+def events(path: Path) -> list[dict]:
+    return [r for r in (json.loads(x) for x in path.read_text("utf-8").splitlines()) if r["event"] != "start"]
+
+
 class JournalTests(unittest.TestCase):
-    def test_only_live_events_are_logged_once_append_only(self):
+    def test_trades_opened_before_the_paper_start_are_not_logged(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "journal.jsonl"
             c = rising(230)
             engine = SignalEngine(TIMEFRAMES["4h"], path, "TEST")
-            engine._started = c[-1].t  # pretend the app started near the end
-            engine.update(c[:205])  # entry happened long before start: not logged
-            self.assertFalse(path.exists())
-            c.append(bar(c[-1], 329, 329.5, 300, 301))
+            engine._started = c[-1].t  # paper trading starts near the end
+            c.append(bar(c[-1], 329, 329.5, 300, 301))  # closes the old position
             engine.update(c)
-            engine.update(c)  # same candle again: no duplicate
-            rows = [json.loads(x) for x in path.read_text("utf-8").splitlines()]
-            self.assertEqual([r["event"] for r in rows], ["close"])
-            self.assertEqual(rows[0]["exit_reason"], "TRAIL")
+            self.assertEqual(events(path), [])
+
+    def test_paper_start_is_written_once_and_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "journal.jsonl"
+            first = paper_start(path)
+            self.assertEqual(SignalEngine(TIMEFRAMES["4h"], path, "A")._started, first)
+            self.assertEqual(SignalEngine(TIMEFRAMES["1d"], path, "B")._started, first)
+            self.assertEqual(path.read_text("utf-8").count('"start"'), 1)
+
+    def test_trade_missed_while_the_app_was_shut_is_backfilled_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "journal.jsonl"
+            c = rising(230)
+            c.append(bar(c[-1], 329, 329.5, 300, 301))
+            path.write_text(json.dumps({"event": "start", "t": c[150].t}) + "\n", "utf-8")
+            # the app only opens after the trade has already opened and closed
+            for _ in range(2):  # two sessions: nothing is written twice
+                SignalEngine(TIMEFRAMES["4h"], path, "TEST").update(c)
+            rows = events(path)
+            self.assertEqual([r["event"] for r in rows], ["open", "close"])
+            self.assertEqual((rows[0]["status"], rows[0]["net_r"], rows[0]["exit_price"]), ("OPEN", None, None))
+            self.assertEqual((rows[1]["exit_reason"], rows[1]["exit_price"]), ("TRAIL", 301))
+            self.assertTrue(rows[0]["backfilled"] and rows[1]["backfilled"])
+            s = paper_summary(path)
+            self.assertEqual((s["trades"], s["open"], s["missed"]), (1, [], 1))
+
+    def test_open_position_shows_in_the_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "journal.jsonl"
+            c = rising(230)
+            path.write_text(json.dumps({"event": "start", "t": c[150].t}) + "\n", "utf-8")
+            SignalEngine(TIMEFRAMES["4h"], path, "TEST").update(c)
+            s = paper_summary(path)
+            self.assertEqual((s["trades"], len(s["open"]), s["open"][0]["direction"]), (0, 1, 1))
+
+
+class PaperFeedTests(unittest.TestCase):
+    def test_paper_covers_the_five_holdout_coins_on_signal_timeframes(self):
+        from data import FEEDS, PAPER_FEEDS
+
+        crypto = {f.symbol for f in (*FEEDS, *PAPER_FEEDS) if isinstance(f, BinanceFeed)}
+        self.assertEqual(crypto, {"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"})
+        for f in (*FEEDS, *PAPER_FEEDS):
+            self.assertTrue(f.signal_timeframes)
+            for key in f.signal_timeframes:
+                self.assertGreaterEqual(TIMEFRAMES[key].seconds, f.min_signal_seconds)
 
 
 if __name__ == "__main__":

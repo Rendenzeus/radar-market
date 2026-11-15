@@ -10,12 +10,14 @@ import flet as ft
 
 from analysis import build_snapshot
 from news import fetch_news
-from data import FEEDS, TIMEFRAMES, Feed, MarketState, default_cache_dir
+from data import FEEDS, PAPER_FEEDS, TIMEFRAMES, Feed, MarketState, default_cache_dir, is_closed
+from signals import engine_for, paper_summary, paper_text
 from views.widgets import BG, BORDER, MUTED, TEXT, MarketCard, signal_color
 
 CACHE_SAVE_SECONDS = 5 * 60
 CLOSED_MARKET_REFRESH = 5 * 60
 NEWS_REFRESH = 5 * 60
+PAPER_REFRESH = 10 * 60
 
 
 class MarketDashboard(ft.Column):
@@ -35,6 +37,7 @@ class MarketDashboard(ft.Column):
         self._last_save = time.time()
         self._wake: dict[str, asyncio.Event] = {}
 
+        self._paper = ft.Text("", size=12, color=TEXT)
         self._clock = ft.Text("", size=12, color=MUTED)
         self._refresh_btn = ft.IconButton(ft.Icons.REFRESH, icon_color=TEXT, tooltip="Perbarui sekarang", on_click=self._refresh_all)
 
@@ -68,7 +71,7 @@ class MarketDashboard(ft.Column):
             border=ft.Border.only(top=ft.BorderSide(1, BORDER)),
         )
         super().__init__(
-            controls=[header, ft.ResponsiveRow(list(self._cards.values()), spacing=16, run_spacing=16), disclaimer],
+            controls=[header, ft.ResponsiveRow(list(self._cards.values()), spacing=16, run_spacing=16), self._paper, disclaimer],
             spacing=18,
         )
 
@@ -98,6 +101,7 @@ class MarketDashboard(ft.Column):
             self._wake[symbol] = asyncio.Event()
             self.page.run_task(self._market_loop, symbol)
         self.page.run_task(self._ticker)
+        self.page.run_task(self._paper_loop)
         for symbol in self._feeds:
             self.page.run_task(self._news_loop, symbol)
 
@@ -153,6 +157,49 @@ class MarketDashboard(ft.Column):
             self._last_save = time.time()
             for s in list(self._states.values()):
                 await asyncio.to_thread(s.save_cache)
+
+    # ------------------------------------------------------- paper trading
+    async def _paper_loop(self) -> None:
+        """Follow every signal market and timeframe, whatever the cards are showing.
+
+        The engine writes entries and exits to the journal, including ones that
+        happened while the app was shut (see signals.SignalEngine._log_live).
+        """
+        while True:
+            for feed in (*FEEDS, *PAPER_FEEDS):
+                for tf_key in feed.signal_timeframes:
+                    await self._paper_one(feed, tf_key)
+            self._show_paper()
+            await asyncio.sleep(PAPER_REFRESH)
+
+    async def _paper_one(self, feed: Feed, tf_key: str) -> None:
+        key = (feed.symbol, tf_key)
+        if key in self._busy:  # the card is refreshing this one and updates the engine itself
+            return
+        if key not in self._states:
+            self._states[key] = MarketState(feed, TIMEFRAMES[tf_key], self._cache_dir)
+        self._busy.add(key)
+        try:
+            await asyncio.to_thread(self._paper_update, self._states[key])
+        except Exception:
+            pass  # no connection: the next round backfills whatever was missed
+        finally:
+            self._busy.discard(key)
+
+    @staticmethod
+    def _paper_update(state: MarketState) -> None:
+        state.refresh()
+        candles = state.candles
+        if candles:
+            closed = candles if is_closed(candles[-1], state.tf.seconds) else candles[:-1]
+            engine_for(state).update(closed)
+
+    def _show_paper(self) -> None:
+        try:
+            self._paper.value = paper_text(paper_summary(self._cache_dir / "journal.jsonl"))
+            self._paper.update()
+        except Exception:
+            pass
 
     async def _news_loop(self, symbol: str) -> None:
         card = self._cards[symbol]
