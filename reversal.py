@@ -25,9 +25,10 @@ from dataclasses import dataclass
 from statistics import fmean
 
 from data import Candle, OrderFlow, Timeframe, is_closed
-from indicators import atr_series, ema_series, macd_series, rsi_series
+from indicators import adx, atr_series, ema_series, macd_series, rsi_series
 
 STAGE_WATCH = 30
+ADX_TREND = 20
 STAGE_SETUP = 50
 PIVOT = 3
 
@@ -177,23 +178,19 @@ def exhaustion(closed: list[Candle], bearish: bool = False) -> tuple[int, list[R
 
 
 def flow_points(flow: OrderFlow, direction: int) -> tuple[int, list[RFactor]]:
-    g = "Order flow"
-    buy = flow.buy_ratio_recent if direction > 0 else 1 - flow.buy_ratio_recent
-    buy_prev = flow.buy_ratio_prev if direction > 0 else 1 - flow.buy_ratio_prev
-    imb = flow.imbalance if direction > 0 else (1 / flow.imbalance if flow.imbalance else 1.0)
+    """Scored on 15 minutes of accumulated taker volume, not on the noisy 60s sample."""
+    g = "Order flow 15m"
     side = "beli" if direction > 0 else "jual"
-    secs = int(flow.window / 2)
+    ratio = flow.buy_ratio_15m if direction > 0 else 1 - flow.buy_ratio_15m
+    last5 = flow.buy_ratio_5m if direction > 0 else 1 - flow.buy_ratio_5m
+    prev10 = flow.buy_ratio_prev10m if direction > 0 else 1 - flow.buy_ratio_prev10m
     f: list[RFactor] = []
-    if buy >= 0.65:
-        f.append(RFactor(g, f"Taker {side} {buy:.0%} dalam ±{secs} dtk terakhir", 12))
-    elif buy >= 0.58:
-        f.append(RFactor(g, f"Taker {side} {buy:.0%} dalam ±{secs} dtk terakhir", 8))
-    elif buy < 0.42:
-        f.append(RFactor(g, f"Tekanan {side} lemah ({buy:.0%}), tren lama masih dominan", -5))
-    if buy - buy_prev >= 0.10:
-        f.append(RFactor(g, f"Tekanan {side} naik {buy - buy_prev:+.0%} dibanding ±{secs} dtk sebelumnya", 3))
-    if imb >= 1.5:
-        f.append(RFactor(g, f"Order book condong ke {side} ({imb:.1f}×) di ±0,25% harga", 5))
+    if ratio >= 0.55:
+        f.append(RFactor(g, f"Taker {side} {ratio:.0%} dari volume 15 menit terakhir", 10))
+    elif ratio <= 0.45:
+        f.append(RFactor(g, f"Taker {side} hanya {ratio:.0%} dalam 15 menit, tren lama masih dominan", -5))
+    if last5 - prev10 >= 0.08:
+        f.append(RFactor(g, f"Tekanan {side} 5 menit terakhir naik {last5 - prev10:+.0%} dari 10 menit sebelumnya", 5))
     return sum(x.points for x in f), f
 
 
@@ -223,9 +220,13 @@ def detect(
     has_news: bool = False,
 ) -> Reversal:
     closed = candles if is_closed(candles[-1], tf.seconds) else candles[:-1]
+    adx_val, _, _ = adx([c.h for c in closed], [c.l for c in closed], [c.c for c in closed])
     trend = trend_direction(closed)
+    if adx_val < ADX_TREND:
+        return Reversal(0, "NONE", 0, [], None, None,
+                        f"Pasar sideways (ADX {adx_val:.0f} < {ADX_TREND}): tidak ada tren untuk dibalik")
     if trend == 0:
-        return Reversal(0, "NONE", 0, [], None, None, "Tidak ada tren jelas untuk dibalik")
+        return Reversal(0, "NONE", 0, [], None, None, f"Arah EMA belum jelas (ADX {adx_val:.0f}), tidak ada tren untuk dibalik")
 
     direction = -trend  # a downtrend looks for a bullish reversal and vice versa
     view = closed if direction > 0 else _mirror(closed)
@@ -254,10 +255,20 @@ def detect(
 
     word = "naik" if direction > 0 else "turun"
     trend_word = "turun" if direction > 0 else "naik"
+    signs = sum(1 for x in factors if x.points > 0)
+    against = sum(1 for x in factors if x.points < 0)
+    if signs == 0:
+        none_note = f"Tren {trend_word} (ADX {adx_val:.0f}), belum ada tanda pembalikan"
+    else:
+        none_note = (
+            f"Tren {trend_word} (ADX {adx_val:.0f}) dengan {signs} tanda pembalikan"
+            + (f" dan {against} yang menentang" if against else "")
+            + f": skor {score}, belum cukup untuk dipantau (≥{STAGE_WATCH})"
+        )
     notes = {
         "TRIGGER": f"Harga menembus {trigger:,.2f}: pembalikan {word} mulai terkonfirmasi",
-        "SETUP": f"Kondisi pembalikan {word} lengkap, tunggu harga tembus {trigger:,.2f}",
-        "WATCH": f"Tren {trend_word} mulai melemah, pantau",
-        "NONE": f"Tren {trend_word} masih sehat, belum ada tanda balik arah",
+        "SETUP": f"{signs} tanda pembalikan {word} terkumpul, tunggu harga tembus {trigger:,.2f}",
+        "WATCH": f"Tren {trend_word} (ADX {adx_val:.0f}) mulai melemah: {signs} tanda pembalikan, pantau",
+        "NONE": none_note,
     }
     return Reversal(direction, stage, score, factors, trigger, invalidation, notes[stage])

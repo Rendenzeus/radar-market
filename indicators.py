@@ -131,3 +131,16 @@ def adx(highs, lows, closes, period: int = 14) -> tuple[float, float, float]:
 
     adx_s = _wilder(dx, period)
     return float(adx_s[-1]), plus_di, minus_di  # type: ignore[arg-type]
+
+
+def pivots(highs, lows, k: int = 3, lookback: int | None = None) -> tuple[list[int], list[int]]:
+    """Indices of confirmed swing highs and swing lows (k bars on each side)."""
+    n = len(highs)
+    start = k if lookback is None else max(k, n - lookback)
+    ph, pl = [], []
+    for i in range(start, n - k):
+        if highs[i] == max(highs[i - k : i + k + 1]):
+            ph.append(i)
+        if lows[i] == min(lows[i - k : i + k + 1]):
+            pl.append(i)
+    return ph, pl

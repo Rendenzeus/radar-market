@@ -41,7 +41,7 @@ class ReversalTests(unittest.TestCase):
 
     def test_trigger_stage_requires_break(self):
         candles, tf = downtrend_with_hammer()
-        flow = OrderFlow(60, 0.7, 0.72, 0.5, 2.0, 1000, time.time())
+        flow = OrderFlow(0.7, 0.75, 0.6, 50.0, 0.7, 2.0, 60, time.time())
         below = detect(candles, tf, candles[-1].c, flow=flow, news_score=0.5, news_shift=0.5, has_news=True)
         self.assertIn(below.stage, {"SETUP", "WATCH"})
         above = detect(candles, tf, below.trigger * 1.01, flow=flow, news_score=0.5, news_shift=0.5, has_news=True)
@@ -49,7 +49,7 @@ class ReversalTests(unittest.TestCase):
             self.assertEqual(above.stage, "TRIGGER")
 
     def test_flow_points_are_symmetric(self):
-        flow = OrderFlow(60, 0.3, 0.3, 0.3, 0.5, 1000, time.time())
+        flow = OrderFlow(0.3, 0.3, 0.3, -50.0, 0.3, 0.5, 60, time.time())
         bull, _ = flow_points(flow, +1)
         bear, _ = flow_points(flow, -1)
         self.assertLess(bull, 0)

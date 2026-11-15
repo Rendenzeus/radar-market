@@ -56,7 +56,9 @@ class MarketDashboard(ft.Column):
             ft.Text(
                 "Analisis teknikal edukatif, bukan rekomendasi finansial. Gold memakai harga futures COMEX "
                 "(GC=F) dari Yahoo yang bisa tertunda ±10 menit; BTC real-time dari Binance. "
-                "Stop/target dihitung dari ATR (1,5× dan 3×).",
+                "Sinyal hanya dari candle close (masuk ±35, keluar ±20, mati saat ADX < 20); "
+                "stop di balik swing terakhir, sinyal ditolak bila R:R TP1 < 1,5. "
+                "Uji historis BTC belum menunjukkan keunggulan, jadi sinyal masih eksperimental.",
                 size=11,
                 color=MUTED,
             ),
@@ -180,20 +182,26 @@ class MarketDashboard(ft.Column):
     def _maybe_alert(self, snap) -> None:
         """Alert only on signals confirmed by a closed candle, so they never repaint."""
         self._maybe_alert_reversal(snap)
-        symbol = (snap.feed.symbol, snap.tf.key)
-        signal = snap.confirmed.signal
-        previous = self._last_alert.get(symbol)
-        self._last_alert[symbol] = signal
-        if previous is None or previous == signal or snap.status == "CLOSED":
+        key = (snap.feed.symbol, snap.tf.key)
+        plan = snap.signal.plan
+        opened = plan.opened_t if plan else None
+        previous = self._last_alert.get(key, "unset")
+        self._last_alert[key] = opened
+        # Alert once per newly opened plan (not on start-up, not when the market is closed).
+        if previous == "unset" or plan is None or opened == previous or snap.status == "CLOSED":
             return
-        if signal in {"STRONG BUY", "STRONG SELL"}:
-            self.page.show_dialog(
-                ft.SnackBar(
-                    ft.Text(f"{snap.feed.label} {snap.tf.key}: {signal} di {snap.price:,.2f} (skor {snap.confirmed.score:+d})", color=BG),
-                    bgcolor=signal_color(signal),
-                    duration=ft.Duration(seconds=8),
-                )
+        word = "BUY" if plan.direction > 0 else "SELL"
+        self.page.show_dialog(
+            ft.SnackBar(
+                ft.Text(
+                    f"{snap.feed.label} {snap.tf.key}: {word} (eksperimental) entry {plan.entry:,.2f} · "
+                    f"stop {plan.stop:,.2f} · TP1 {plan.tp1:,.2f} ({plan.rr1:.1f}R)",
+                    color=BG,
+                ),
+                bgcolor=signal_color(word),
+                duration=ft.Duration(seconds=10),
             )
+        )
 
 
     def _maybe_alert_reversal(self, snap) -> None:

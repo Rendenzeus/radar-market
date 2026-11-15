@@ -105,14 +105,17 @@ def resample(candles: list[Candle], seconds: int) -> list[Candle]:
 
 @dataclass(frozen=True)
 class OrderFlow:
-    """Aggressor flow over the last ~60s of trades plus order-book imbalance."""
+    """Aggressor flow. The scored part is accumulated over 15 closed 1m candles
+    (taker-buy volume from klines); the ~60s trade window and the order-book
+    imbalance are too noisy for a 15m decision and are shown as info only."""
 
-    window: float  # seconds covered by the trades
-    buy_ratio: float  # taker-buy volume / total volume, 0..1
-    buy_ratio_recent: float  # newer half of the window
-    buy_ratio_prev: float  # older half of the window
-    imbalance: float  # bid qty / ask qty within 0.25% of mid price
-    trades: int
+    buy_ratio_15m: float  # taker-buy volume / total volume, last 15 closed minutes
+    buy_ratio_5m: float  # last 5 closed minutes
+    buy_ratio_prev10m: float  # the 10 minutes before that
+    cvd_15m: float  # cumulative volume delta (buy - sell, base asset) over 15 minutes
+    buy_ratio_60s: float  # info only
+    imbalance: float  # info only: bid qty / ask qty within 0.25% of mid price
+    window: float  # seconds covered by the 60s trade sample
     time: float
 
 
@@ -173,19 +176,17 @@ class BinanceFeed(Feed):
         raise ConnectionError(f"Binance tidak dapat dihubungi: {last_error}")
 
     def fetch_flow(self) -> OrderFlow:
+        klines = self._get(f"/api/v3/klines?symbol={self.symbol}&interval=1m&limit=16")[:-1]  # drop forming minute
         trades = self._get(f"/api/v3/aggTrades?symbol={self.symbol}&limit=1000")
         book = self._get(f"/api/v3/depth?symbol={self.symbol}&limit=100")
-        end = trades[-1]["T"] / 1000
-        start = trades[0]["T"] / 1000
-        mid_t = (start + end) / 2
 
-        def ratio(rows) -> float:
-            buy = sum(float(r["q"]) for r in rows if not r["m"])  # m=True: buyer was maker -> taker sold
-            total = sum(float(r["q"]) for r in rows)
-            return buy / total if total else 0.5
+        def kratio(rows) -> float:
+            vol = sum(float(r[5]) for r in rows)
+            return sum(float(r[9]) for r in rows) / vol if vol else 0.5  # r[9]: taker-buy base volume
 
-        recent = [r for r in trades if r["T"] / 1000 >= mid_t]
-        older = [r for r in trades if r["T"] / 1000 < mid_t]
+        cvd = sum(2 * float(r[9]) - float(r[5]) for r in klines)
+        buy = sum(float(r["q"]) for r in trades if not r["m"])  # m=True: buyer was maker -> taker sold
+        total = sum(float(r["q"]) for r in trades)
         best_bid = float(book["bids"][0][0])
         best_ask = float(book["asks"][0][0])
         mid = (best_bid + best_ask) / 2
@@ -193,12 +194,13 @@ class BinanceFeed(Feed):
         bids = sum(float(q) for p, q in book["bids"] if float(p) >= mid - band)
         asks = sum(float(q) for p, q in book["asks"] if float(p) <= mid + band)
         return OrderFlow(
-            window=end - start,
-            buy_ratio=ratio(trades),
-            buy_ratio_recent=ratio(recent),
-            buy_ratio_prev=ratio(older),
+            buy_ratio_15m=kratio(klines),
+            buy_ratio_5m=kratio(klines[-5:]),
+            buy_ratio_prev10m=kratio(klines[:-5]),
+            cvd_15m=cvd,
+            buy_ratio_60s=buy / total if total else 0.5,
             imbalance=bids / asks if asks else 1.0,
-            trades=len(trades),
+            window=(trades[-1]["T"] - trades[0]["T"]) / 1000,
             time=time.time(),
         )
 
@@ -295,6 +297,7 @@ class MarketState:
     def __init__(self, feed: Feed, tf: Timeframe, cache_dir: Path):
         self.feed = feed
         self.tf = tf
+        self.cache_dir = cache_dir
         self.candles: list[Candle] = []
         self.quote: Quote | None = None
         self.last_full_sync = 0.0
@@ -353,6 +356,6 @@ def default_cache_dir() -> Path:
 
 
 FEEDS: tuple[Feed, ...] = (
-    YahooFeed("GC=F", "Gold", "XAU", "COMEX futures · Yahoo"),
+    YahooFeed("GC=F", "Gold Futures", "GC", "COMEX GC=F · Yahoo · bukan harga spot"),
     BinanceFeed("BTCUSDT", "Bitcoin", "BTC"),
 )

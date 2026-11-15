@@ -6,7 +6,8 @@ import time
 
 import flet as ft
 
-from analysis import Snapshot
+from analysis import ENTER, EXIT, Snapshot
+from datetime import datetime
 from data import DEFAULT_TIMEFRAME, TIMEFRAMES
 from views.chart import EMA20_COLOR, EMA50_COLOR, PriceChart
 
@@ -166,15 +167,23 @@ class MarketCard(ft.Container):
         self._score = ft.Text("", size=13, color=MUTED)
         self._bar = ScoreBar()
         self._confirm_icon = ft.Icon(ft.Icons.SCHEDULE, size=14, color=MUTED)
-        self._confirm = ft.Text("", size=12, color=MUTED)
+        self._confirm = ft.Text("", size=12, color=MUTED, expand=True)
+        self._preview = ft.Text("", size=11, color=MUTED)
+        self._track = ft.Text("", size=11, color=MUTED)
         self._signal_box = ft.Container(
             ft.Column(
                 [
-                    ft.Row([self._signal, self._score], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                    ft.Row(
+                        [ft.Row([self._signal, badge("EKSPERIMENTAL", AMBER)], spacing=8, tight=True), self._score],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        wrap=True,
+                    ),
                     self._bar,
-                    ft.Row([self._confirm_icon, self._confirm], spacing=6),
+                    ft.Row([self._confirm_icon, self._confirm], spacing=6, vertical_alignment=ft.CrossAxisAlignment.START),
+                    self._preview,
+                    self._track,
                 ],
-                spacing=10,
+                spacing=8,
             ),
             padding=14,
             border_radius=12,
@@ -238,16 +247,25 @@ class MarketCard(ft.Container):
         atr_box, self._atr, self._atr_caption = stat("ATR")
         trend_box, self._trend, self._trend_caption = stat("Tren TF besar")
 
-        self._stop = ft.Text("-", size=14, weight=ft.FontWeight.W_600, color=RED)
-        self._tp1 = ft.Text("-", size=14, weight=ft.FontWeight.W_600, color=GREEN)
-        self._tp2 = ft.Text("-", size=14, weight=ft.FontWeight.W_600, color=GREEN)
+        def cell(caption: str, color: str) -> tuple[ft.Column, ft.Text]:
+            value = ft.Text("-", size=14, weight=ft.FontWeight.W_600, color=color)
+            return ft.Column([ft.Text(caption, size=11, color=MUTED), value], spacing=2, expand=1), value
+
+        entry_col, self._entry = cell("Entry (terkunci)", TEXT)
+        stop_col, self._stop = cell("Stop loss", RED)
+        tp1_col, self._tp1 = cell("Target 1", GREEN)
+        tp2_col, self._tp2 = cell("Target 2", GREEN)
+        self._plan_title = ft.Text("", size=12, weight=ft.FontWeight.W_600, color=TEXT)
+        self._plan_status = ft.Text("", size=11, color=MUTED)
         self._levels = ft.Container(
-            ft.Row(
+            ft.Column(
                 [
-                    ft.Column([ft.Text("Stop loss", size=11, color=MUTED), self._stop], spacing=2, expand=1),
-                    ft.Column([ft.Text("Target 1", size=11, color=MUTED), self._tp1], spacing=2, expand=1),
-                    ft.Column([ft.Text("Target 2", size=11, color=MUTED), self._tp2], spacing=2, expand=1),
-                ]
+                    self._plan_title,
+                    ft.Row([entry_col, stop_col]),
+                    ft.Row([tp1_col, tp2_col]),
+                    self._plan_status,
+                ],
+                spacing=8,
             ),
             padding=ft.Padding.symmetric(horizontal=12, vertical=10),
             border_radius=10,
@@ -278,7 +296,7 @@ class MarketCard(ft.Container):
             height=40,
             border_radius=20,
             alignment=ft.Alignment.CENTER,
-            bgcolor="#E8B931" if short == "XAU" else "#F7931A",
+            bgcolor="#E8B931" if short == "GC" else "#F7931A",
         )
         header = ft.Row(
             [
@@ -321,8 +339,8 @@ class MarketCard(ft.Container):
         self.error = None
         self._error.visible = False
 
-        live, conf = snap.live, snap.confirmed
-        color = signal_color(live.signal)
+        live, conf, sig = snap.live, snap.confirmed, snap.signal
+        color = signal_color(sig.label)
 
         self._price.value = fmt_price(snap.price)
         if prev is not None and snap.price != prev.price:
@@ -334,49 +352,88 @@ class MarketCard(ft.Container):
         self._change.color = GREEN if up else RED
         rev = snap.reversal
         markers = []
-        if rev.stage != "NONE" and rev.trigger is not None:
+        if sig.plan is not None:
+            pl = sig.plan
+            markers = [(pl.entry, TEXT, "Entry"), (pl.stop, RED, "Stop"), (pl.tp1, GREEN, "TP1"), (pl.tp2, GREEN, "TP2")]
+        elif rev.stage != "NONE" and rev.trigger is not None:
             markers = [(rev.trigger, BLUE, "Pemicu"), (rev.invalidation, MUTED, "Batal")]
         self._chart.set_markers(markers)
         self._chart.set_data(snap.chart, snap.ema20, snap.ema50, snap.price, snap.tf.seconds)
         self._show_reversal(snap)
         self._chart_hint.value = f"Timeframe {tf_label(snap.tf.key)}"
         self._atr_caption.value = f"ATR {tf_label(snap.tf.key)}"
-        self._trend_caption.value = f"Tren {tf_label(live.htf)}"
+        self._trend_caption.value = f"Tren {tf_label(conf.htf)}"
 
         closed = snap.status == "CLOSED"
-        self._signal.value = live.signal
+        tf = tf_label(snap.tf.key)
+        self._signal.value = sig.label
         self._signal.color = MUTED if closed else color
-        self._score.value = f"skor {live.score:+d}/100"
-        self._bar.set_score(live.score)
-        self._signal_box.border = ft.Border.all(1, ft.Colors.with_opacity(0.45, color) if not closed else BORDER)
+        self._score.value = f"skor {conf.score:+d}/100 (candle close)"
+        self._bar.set_score(conf.score)
+        self._signal_box.border = ft.Border.all(1, ft.Colors.with_opacity(0.45, color) if sig.plan and not closed else BORDER)
 
-        if closed:
-            self._confirm_icon.icon, self._confirm_icon.color = ft.Icons.NIGHTLIGHT_ROUND, MUTED
-            self._confirm.value = "Pasar tutup — sinyal dari sesi terakhir"
-        elif conf.signal == live.signal:
-            self._confirm_icon.icon, self._confirm_icon.color = ft.Icons.CHECK_CIRCLE, color
-            self._confirm.value = f"Terkonfirmasi di close candle {tf_label(snap.tf.key)}"
+        def hhmm(t: int) -> str:
+            return datetime.fromtimestamp(t + snap.tf.seconds).strftime("%d %b %H:%M")
+
+        if sig.plan is not None:
+            word = "BUY" if sig.plan.direction > 0 else "SELL"
+            icon, icolor = ft.Icons.CHECK_CIRCLE, color
+            text = f"{word} dari close candle {tf} {hhmm(sig.plan.opened_t)}. Keluar bila |skor| < {EXIT} atau kena stop/target."
+            if conf.sideways:
+                text += f" ADX kini {conf.adx:.0f} < 20: tidak ada entry baru, posisi lama dikelola rencananya."
+        elif conf.sideways:
+            icon, icolor = ft.Icons.BLOCK, MUTED
+            text = f"ADX {conf.adx:.0f} < 20: pasar sideways, sinyal tren dimatikan."
+        elif sig.rejection and sig.rejection_t == conf.t:
+            icon, icolor = ft.Icons.DO_NOT_DISTURB_ON, AMBER
+            text = sig.rejection
         else:
-            self._confirm_icon.icon, self._confirm_icon.color = ft.Icons.SCHEDULE, AMBER
-            self._confirm.value = f"Belum close — candle terakhir: {conf.signal} ({conf.score:+d})"
+            icon, icolor = ft.Icons.SCHEDULE, MUTED
+            text = f"Menunggu: sinyal muncul bila skor candle close ≥ +{ENTER} atau ≤ −{ENTER} dan R:R ≥ 1,5."
+        if closed:
+            icon, icolor = ft.Icons.NIGHTLIGHT_ROUND, MUTED
+            text = "Pasar tutup. " + text
+        self._confirm_icon.icon, self._confirm_icon.color = icon, icolor
+        self._confirm.value = text
+        self._preview.value = (
+            f"Pratinjau candle berjalan (belum final): skor {live.score:+d}"
+            + (" · ADX < 20" if live.sideways else "")
+        )
+        n, win, avg_r = sig.stats()
+        self._track.value = (
+            f"Rekam jejak {n} sinyal di ±200 candle terakhir: menang {win:.0%}, rata-rata {avg_r:+.2f}R. "
+            "Uji historis BTC (5.000 candle) belum menunjukkan keunggulan dibanding entry acak."
+            if n
+            else "Belum ada sinyal selesai di ±200 candle terakhir. Uji historis BTC belum menunjukkan keunggulan dibanding entry acak."
+        )
 
-        self._rsi.value = f"{live.rsi:.1f}"
-        self._rsi.color = RED if live.rsi > 70 else GREEN if live.rsi < 30 else TEXT
-        self._adx.value = f"{live.adx:.0f} · {'sideways' if live.sideways else 'trending'}"
-        self._atr.value = fmt_price(live.atr)
-        self._trend.value = {1: "▲ Naik", -1: "▼ Turun", 0: "◆ Datar"}[live.trend_htf]
-        self._trend.color = {1: GREEN, -1: RED, 0: MUTED}[live.trend_htf]
+        self._rsi.value = f"{conf.rsi:.1f}"
+        self._rsi.color = RED if conf.rsi > 70 else GREEN if conf.rsi < 30 else TEXT
+        self._adx.value = f"{conf.adx:.0f} · {'sideways' if conf.sideways else 'trending'}"
+        self._atr.value = fmt_price(conf.atr)
+        self._trend.value = {1: "▲ Naik", -1: "▼ Turun", 0: "◆ Datar"}[conf.trend_htf]
+        self._trend.color = {1: GREEN, -1: RED, 0: MUTED}[conf.trend_htf]
 
-        if snap.levels and not closed:
+        plan = sig.plan
+        if plan is not None:
             self._levels.visible = True
-            self._stop.value = fmt_price(snap.levels.stop)
-            self._tp1.value = fmt_price(snap.levels.tp1)
-            self._tp2.value = fmt_price(snap.levels.tp2)
+            word = "BUY" if plan.direction > 0 else "SELL"
+            self._plan_title.value = f"Rencana {word} · risiko {fmt_price(plan.risk)} per unit (1R)"
+            self._entry.value = fmt_price(plan.entry)
+            self._stop.value = fmt_price(plan.stop) + (" (BE)" if plan.status == "TP1" else "")
+            self._tp1.value = f"{fmt_price(plan.tp1)} · {plan.rr1:.1f}R"
+            self._tp2.value = f"{fmt_price(plan.tp2)} · {plan.rr2:.1f}R"
+            open_r = (snap.price - plan.entry) * plan.direction / plan.risk
+            status = "TP1 tercapai, setengah posisi diamankan, stop pindah ke entry" if plan.status == "TP1" else "Berjalan"
+            self._plan_status.value = (
+                f"{status} · posisi sekarang {open_r:+.2f}R. Stop di balik swing terakhir + 0,25 ATR, "
+                "level tidak berubah sampai sinyal selesai."
+            )
         else:
             self._levels.visible = False
 
         rows = []
-        for f in sorted(live.factors, key=lambda f: -abs(f.points)):
+        for f in sorted(conf.factors, key=lambda f: -abs(f.points)):
             c = GREEN if f.points > 0 else RED if f.points < 0 else MUTED
             rows.append(
                 ft.Row(
@@ -431,8 +488,9 @@ class MarketCard(ft.Container):
         flow = snap.flow
         if flow is not None:
             self._rev_flow.value = (
-                f"Order flow ±{flow.window:.0f} dtk: taker beli {flow.buy_ratio:.0%} "
-                f"(paruh terbaru {flow.buy_ratio_recent:.0%}) · bid/ask {flow.imbalance:.2f}×"
+                f"Order flow 15 menit (dipakai di skor): taker beli {flow.buy_ratio_15m:.0%}, "
+                f"5 mnt terakhir {flow.buy_ratio_5m:.0%}. Info saja: {flow.window:.0f} dtk terakhir "
+                f"{flow.buy_ratio_60s:.0%}, bid/ask {flow.imbalance:.2f}×."
             )
         else:
             self._rev_flow.value = "Order flow tidak tersedia untuk sumber ini (Yahoo), hanya candle + berita."
@@ -538,7 +596,9 @@ class MarketCard(ft.Container):
             self._status.content = badge("MEMUAT", MUTED)
             return
         age = time.time() - snap.quote_time
-        status = snap.status if time.time() - snap.fetched_at < 60 else "DELAYED"
+        status = snap.status
+        if status != "CLOSED" and time.time() - snap.fetched_at > 60:
+            status = "DELAYED"  # sync stalled; a closed market keeps its single status
         if status == "LIVE":
             self._status.content = badge("LIVE", GREEN)
         elif status == "CLOSED":

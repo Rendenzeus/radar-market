@@ -65,10 +65,11 @@ class SignalTests(unittest.TestCase):
 
     def test_labels(self):
         self.assertEqual(label_for(70), "STRONG BUY")
-        self.assertEqual(label_for(30), "BUY")
-        self.assertEqual(label_for(0), "WAIT")
-        self.assertEqual(label_for(-30), "SELL")
+        self.assertEqual(label_for(40), "BUY")
+        self.assertEqual(label_for(30), "WAIT")  # below the entry band
+        self.assertEqual(label_for(-40), "SELL")
         self.assertEqual(label_for(-61), "STRONG SELL")
+        self.assertEqual(label_for(-80, gated=True), "WAIT")  # ADX gate
 
     def test_every_timeframe_evaluates(self):
         from data import TIMEFRAMES
