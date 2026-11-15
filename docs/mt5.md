@@ -56,10 +56,20 @@ ada selisih nyata di atas BUY acak. Aturan v2 tidak diubah berdasarkan ini; kala
 Skrip ini menjalankan aturan v2 di XAUUSD 4h dan 1D memakai candle broker, lalu mengirim
 order ke akun demo.
 
-- **Hanya demo.** Skrip berhenti kalau akun yang login bukan akun demo.
-- **Hanya sinyal segar.** Entry dikirim hanya kalau candle breakout adalah candle yang baru
-  saja close. Sinyal yang ketahuan terlambat (skrip mati saat candle close) dicatat sebagai
-  `missed`, tidak dieksekusi.
+- **Hanya demo, dicek terus.** Jenis akun dicek di setiap putaran dan sekali lagi tepat
+  sebelum setiap order. Kalau login MT5 diganti ke akun real, skrip berhenti tanpa mengirim apa pun.
+- **Hanya sinyal yang dilihat langsung.** Entry dikirim hanya kalau skrip sendiri melihat
+  candle breakout close: candle itu harus berubah jadi candle close terakhir di antara dua
+  putaran yang jaraknya paling lama 2 menit. Skrip yang baru dinyalakan setelah close,
+  terminal yang terputus, atau laptop yang tidur membuat sinyal dicatat `missed`.
+- **Satu percobaan per entry.** Order yang ditolak dicatat sekali sebagai `error` lalu `missed`,
+  tidak dicoba ulang.
+- **Posisi dikenali dari nomor tiket di jurnal**, bukan dari komentar order. Posisi lain di
+  akun (manual atau dari skrip lain) tidak pernah disentuh.
+- **Sambung ulang otomatis.** Kalau terminal MT5 tertutup atau koneksi putus, skrip mencatat
+  `disconnected` sekali, terus mencoba menyambung, lalu mencatat `reconnected`.
+- **Error yang sama hanya dicatat sekali**, misalnya penutupan posisi yang ditolak saat pasar
+  tutup (tetap dicoba lagi tiap putaran).
 - **Hanya sinyal setelah mulai.** Posisi yang menurut aturan sudah berjalan sebelum skrip
   pertama kali dijalankan tidak diikuti.
 - **Stop 2 × ATR dipasang di order**, jadi broker yang menjalankannya. Keluar trailing
@@ -68,7 +78,7 @@ order ke akun demo.
 - **Hasil memakai uang sungguhan di akun demo**: fill, swap, dan komisi dari riwayat akun.
   R = profit posisi ÷ uang yang dipertaruhkan.
 - **Jurnal** di `~/.market-radar/mt5_paper.jsonl`: append-only, satu baris per kejadian
-  (`start`, `open`, `exit_sent`, `close`, `missed`, `blocked`, `error`), tidak pernah ditulis ulang.
+  (`start`, `open`, `exit_sent`, `close`, `missed`, `error`, `disconnected`, `reconnected`, `stopped`), tidak pernah ditulis ulang.
 
 Menjalankan (MT5 harus terbuka, login ke akun demo, dan tombol **Algo Trading** menyala):
 
