@@ -10,13 +10,15 @@ and ADX scales the score down in sideways markets.
 from __future__ import annotations
 
 import time
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from statistics import fmean
 
-from data import INTERVAL_SECONDS, Candle, Feed, MarketState
+from data import HTF_SECONDS, TIMEFRAMES, Candle, Feed, MarketState, Timeframe, is_closed, resample
 from indicators import adx, atr_series, bollinger, ema_series, macd_series, rsi_series
 
 MIN_CANDLES = 260
+CHART_CANDLES = 200
 STRONG = 60
 NORMAL = 25
 
@@ -36,8 +38,9 @@ class Evaluation:
     rsi: float
     adx: float
     atr: float
-    trend_1h: int  # +1 up, -1 down, 0 flat
+    trend_htf: int  # +1 up, -1 down, 0 flat on the higher timeframe
     sideways: bool
+    htf: str
 
 
 @dataclass(frozen=True)
@@ -53,7 +56,10 @@ class Snapshot:
     price: float
     quote_time: float
     change_24h: float
-    spark: list[float]
+    tf: Timeframe
+    chart: list[Candle]  # last CHART_CANDLES candles, forming candle included
+    ema20: list[float | None]  # aligned with ``chart``
+    ema50: list[float | None]
     live: Evaluation
     confirmed: Evaluation  # evaluated on closed candles only (does not repaint)
     levels: Levels | None
@@ -87,19 +93,12 @@ def label_for(score: float) -> str:
     return "WAIT"
 
 
-def _to_hourly(candles: list[Candle]) -> list[float]:
-    """Resample 15m closes into 1h closes (last close of each hour)."""
-    closes: dict[int, float] = {}
-    for c in candles:
-        closes[c.t - c.t % 3600] = c.c
-    return list(closes.values())
-
-
 def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-def evaluate(candles: list[Candle]) -> Evaluation:
+def evaluate(candles: list[Candle], tf: Timeframe | None = None) -> Evaluation:
+    tf = tf or TIMEFRAMES["15m"]
     if len(candles) < MIN_CANDLES:
         raise ValueError("Data candle belum cukup untuk analisis.")
 
@@ -117,15 +116,16 @@ def evaluate(candles: list[Candle]) -> Evaluation:
     adx_val, plus_di, minus_di = adx(highs, lows, closes)
     lower, middle, upper = bollinger(closes)
 
-    hourly = _to_hourly(candles)
-    h_ema50 = ema_series(hourly, 50)
-    trend_1h = 0
-    if len(hourly) >= 55 and h_ema50[-1] is not None and h_ema50[-4] is not None:
+    # Higher-timeframe trend: close vs a rising/falling EMA50 on resampled bars.
+    higher = [c.c for c in resample(candles, HTF_SECONDS[tf.htf_key])]
+    h_ema50 = ema_series(higher, 50)
+    trend_htf = 0
+    if len(higher) >= 55 and h_ema50[-1] is not None and h_ema50[-4] is not None:
         rising = h_ema50[-1] > h_ema50[-4]
-        if hourly[-1] > h_ema50[-1] and rising:
-            trend_1h = 1
-        elif hourly[-1] < h_ema50[-1] and not rising:
-            trend_1h = -1
+        if higher[-1] > h_ema50[-1] and rising:
+            trend_htf = 1
+        elif higher[-1] < h_ema50[-1] and not rising:
+            trend_htf = -1
 
     f: list[Factor] = []
 
@@ -136,9 +136,9 @@ def evaluate(candles: list[Candle]) -> Evaluation:
     f.append(Factor("EMA 200", "Harga di atas EMA200" if above else "Harga di bawah EMA200", 10 if above else -10))
     f.append(
         Factor(
-            "Trend 1 jam",
-            {1: "Uptrend di chart 1 jam", -1: "Downtrend di chart 1 jam", 0: "Chart 1 jam datar"}[trend_1h],
-            15 * trend_1h,
+            f"Trend {tf.htf_key}",
+            {1: "Uptrend", -1: "Downtrend", 0: "Datar / belum jelas"}[trend_htf] + f" di chart {tf.htf_key}",
+            15 * trend_htf,
         )
     )
     di = 5 if plus_di > minus_di else -5
@@ -155,7 +155,7 @@ def evaluate(candles: list[Candle]) -> Evaluation:
     f.append(Factor("RSI", f"RSI {rsi:.0f} " + ("(momentum naik)" if rsi > 55 else "(momentum turun)" if rsi < 45 else "(netral)"), rsi_pts))
 
     # --- Volume confirmation on the last closed bar (max 10) --------------
-    closed = [c for c in candles if c.closed] or candles
+    closed = [c for c in candles if is_closed(c, tf.seconds)] or candles
     last = closed[-1]
     avg_vol = fmean(c.v for c in closed[-21:-1]) if len(closed) > 21 else 0
     if avg_vol > 0 and last.v >= 1.3 * avg_vol:
@@ -182,7 +182,7 @@ def evaluate(candles: list[Candle]) -> Evaluation:
         f.append(Factor("ADX", f"ADX {adx_val:.0f}: tren {'kuat' if adx_val >= 30 else 'cukup'}", 0))
 
     score = int(round(_clip(raw / 100) * 100))
-    return Evaluation(score, label_for(score), f, rsi, adx_val, atr, trend_1h, sideways)
+    return Evaluation(score, label_for(score), f, rsi, adx_val, atr, trend_htf, sideways, tf.htf_key)
 
 
 def build_snapshot(state: MarketState) -> Snapshot:
@@ -192,17 +192,24 @@ def build_snapshot(state: MarketState) -> Snapshot:
     price = state.quote.price
 
     # Patch the forming candle with the latest quote so the live view is current.
+    tf = state.tf
     last = candles[-1]
-    if not last.closed and last.c != price:
+    if not is_closed(last, tf.seconds) and last.c != price:
         candles = candles[:-1] + [Candle(last.t, last.o, max(last.h, price), min(last.l, price), price, last.v)]
 
-    live = evaluate(candles)
-    closed = candles if candles[-1].closed else candles[:-1]
-    confirmed = evaluate(closed)
+    live = evaluate(candles, tf)
+    closed = candles if is_closed(candles[-1], tf.seconds) else candles[:-1]
+    confirmed = evaluate(closed, tf)
 
-    bars_24h = 24 * 3600 // INTERVAL_SECONDS
-    ref = candles[-bars_24h - 1].c if len(candles) > bars_24h else candles[0].c
+    # 24h change: close of the last candle that opened 24h before the quote.
+    times = [c.t for c in candles]
+    idx = bisect_right(times, state.quote.time - 86400) - 1
+    ref = candles[max(idx, 0)].c
     change = (price / ref - 1) * 100
+
+    closes = [c.c for c in candles]
+    ema20 = ema_series(closes, 20)[-CHART_CANDLES:]
+    ema50 = ema_series(closes, 50)[-CHART_CANDLES:]
 
     levels = None
     if live.signal != "WAIT":
@@ -218,7 +225,10 @@ def build_snapshot(state: MarketState) -> Snapshot:
         price=price,
         quote_time=state.quote.time,
         change_24h=change,
-        spark=[c.c for c in candles[-bars_24h:]],
+        tf=tf,
+        chart=candles[-CHART_CANDLES:],
+        ema20=ema20,
+        ema50=ema50,
         live=live,
         confirmed=confirmed,
         levels=levels,

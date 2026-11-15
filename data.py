@@ -1,8 +1,8 @@
 """Market data feeds with incremental updates and an on-disk candle cache.
 
-The first sync downloads ~10 days of 15-minute candles. Every refresh after
-that only downloads the last few candles (a few hundred bytes) and merges them
-into the cache, which is what keeps the refresh loop fast.
+The first sync for a (market, timeframe) downloads enough history for the
+indicators. Every refresh after that only downloads the last few candles and
+merges them into the cache, which is what keeps the refresh loop fast.
 """
 
 from __future__ import annotations
@@ -17,9 +17,31 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-INTERVAL_SECONDS = 15 * 60
-MAX_CANDLES = 1200
+MAX_CANDLES = 1500
 FULL_RESYNC_SECONDS = 30 * 60
+
+
+@dataclass(frozen=True)
+class Timeframe:
+    key: str  # label shown in the UI and Binance interval code
+    seconds: int
+    htf_key: str  # higher timeframe used for trend confirmation
+
+
+TIMEFRAMES: dict[str, Timeframe] = {
+    tf.key: tf
+    for tf in (
+        Timeframe("1m", 60, "15m"),
+        Timeframe("5m", 300, "1h"),
+        Timeframe("15m", 900, "1h"),
+        Timeframe("30m", 1800, "4h"),
+        Timeframe("1h", 3600, "4h"),
+        Timeframe("4h", 14400, "1d"),
+        Timeframe("1d", 86400, "1w"),
+    )
+}
+HTF_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 7 * 86400}
+DEFAULT_TIMEFRAME = "15m"
 
 _HEADERS = {
     # Yahoo answers 429 to full browser user-agents without cookies; keep it short.
@@ -59,9 +81,22 @@ class Candle:
     c: float
     v: float
 
-    @property
-    def closed(self) -> bool:
-        return self.t + INTERVAL_SECONDS <= time.time()
+
+def is_closed(candle: Candle, seconds: int, now: float | None = None) -> bool:
+    return candle.t + seconds <= (now if now is not None else time.time())
+
+
+def resample(candles: list[Candle], seconds: int) -> list[Candle]:
+    """Aggregate candles into buckets of ``seconds`` (UTC aligned)."""
+    out: list[Candle] = []
+    for c in candles:
+        bucket = c.t - c.t % seconds
+        if out and out[-1].t == bucket:
+            last = out[-1]
+            out[-1] = Candle(bucket, last.o, max(last.h, c.h), min(last.l, c.l), c.c, last.v + c.v)
+        else:
+            out.append(Candle(bucket, c.o, c.h, c.l, c.c, c.v))
+    return out
 
 
 @dataclass(frozen=True)
@@ -71,17 +106,20 @@ class Quote:
 
 
 class Feed:
-    """Base class. Subclasses implement ``_fetch(full)``."""
+    """Base class. Subclasses implement ``fetch(tf, full)``."""
 
     symbol: str
     label: str
     short: str
     source: str
     always_open: bool = False
-    recent_window: float = 3600  # seconds an incremental request safely covers
     refresh_seconds: float = 15
 
-    def _fetch(self, full: bool) -> tuple[list[Candle], Quote]:
+    def fetch(self, tf: Timeframe, full: bool) -> tuple[list[Candle], Quote]:
+        raise NotImplementedError
+
+    def recent_window(self, tf: Timeframe) -> float:
+        """Seconds of history an incremental request safely covers."""
         raise NotImplementedError
 
 
@@ -96,12 +134,14 @@ class BinanceFeed(Feed):
         self.short = short
         self.source = "Binance spot · real-time"
         self.always_open = True
-        self.recent_window = 30 * 60  # limit=3 -> 45 minutes of candles
         self.refresh_seconds = 3
         self._host = self.HOSTS[0]
 
-    def _fetch(self, full: bool) -> tuple[list[Candle], Quote]:
-        query = urlencode({"symbol": self.symbol, "interval": "15m", "limit": 1000 if full else 3})
+    def recent_window(self, tf: Timeframe) -> float:
+        return tf.seconds * 2  # limit=3 -> current + 2 previous candles
+
+    def fetch(self, tf: Timeframe, full: bool) -> tuple[list[Candle], Quote]:
+        query = urlencode({"symbol": self.symbol, "interval": tf.key, "limit": 1000 if full else 3})
         last_error: Exception | None = None
         for host in (self._host, *[h for h in self.HOSTS if h != self._host]):
             try:
@@ -123,17 +163,34 @@ class BinanceFeed(Feed):
 class YahooFeed(Feed):
     """Yahoo Finance chart API (used for COMEX gold futures)."""
 
+    # timeframe -> (Yahoo interval, full range, incremental range). 4h is resampled from 60m.
+    PARAMS = {
+        "1m": ("1m", "5d", "1d"),
+        "5m": ("5m", "15d", "1d"),
+        "15m": ("15m", "20d", "1d"),
+        "30m": ("30m", "40d", "1d"),
+        "1h": ("60m", "90d", "5d"),
+        "4h": ("60m", "1y", "5d"),
+        "1d": ("1d", "5y", "1mo"),
+    }
+
     def __init__(self, ticker: str, label: str, short: str, source: str):
         self.symbol = ticker
         self.label = label
         self.short = short
         self.source = source
-        self.recent_window = 12 * 3600  # range=1d
         self.refresh_seconds = 15
 
-    def _fetch(self, full: bool) -> tuple[list[Candle], Quote]:
-        query = urlencode({"interval": "15m", "range": "15d" if full else "1d", "includePrePost": "true"})
+    def recent_window(self, tf: Timeframe) -> float:
+        return {"1d": 20 * 86400, "1h": 3 * 86400, "4h": 3 * 86400}.get(tf.key, 12 * 3600)
+
+    def fetch(self, tf: Timeframe, full: bool) -> tuple[list[Candle], Quote]:
+        interval, full_range, recent_range = self.PARAMS[tf.key]
+        query = urlencode(
+            {"interval": interval, "range": full_range if full else recent_range, "includePrePost": "true"}
+        )
         payload = None
+        last_error: Exception | None = None
         for host in ("query1", "query2"):
             try:
                 payload = _get_json(f"https://{host}.finance.yahoo.com/v8/finance/chart/{self.symbol}?{query}")
@@ -142,12 +199,14 @@ class YahooFeed(Feed):
                 last_error = exc
         if payload is None:
             raise ConnectionError(f"Yahoo Finance tidak dapat dihubungi: {last_error}")
+
         chart = payload.get("chart", {})
         if chart.get("error") or not chart.get("result"):
             raise ValueError("Yahoo Finance tidak mengembalikan data.")
         item = chart["result"][0]
         meta = item.get("meta", {})
         quote = (item.get("indicators", {}).get("quote") or [{}])[0]
+        base_seconds = 3600 if interval == "60m" else tf.seconds
         candles = []
         for t, o, h, l, c, v in zip(
             item.get("timestamp") or [],
@@ -159,27 +218,36 @@ class YahooFeed(Feed):
         ):
             if None in (o, h, l, c):
                 continue
-            # Align to the 15m grid; Yahoo's last point is sometimes stamped "now".
-            t = int(t) - int(t) % INTERVAL_SECONDS
+            t = int(t)
+            if base_seconds < 86400:
+                # Align to the grid; Yahoo's last point is sometimes stamped "now".
+                t -= t % base_seconds
             candles.append(Candle(t, float(o), float(h), float(l), float(c), float(v or 0)))
+        price = meta.get("regularMarketPrice")
+        quote_time = meta.get("regularMarketTime")
         if not candles:
-            raise ValueError("Data candle kosong.")
-        price = float(meta.get("regularMarketPrice") or candles[-1].c)
-        quote_time = float(meta.get("regularMarketTime") or candles[-1].t)
-        return candles, Quote(price, quote_time)
+            # Normal for an incremental request while the market is closed.
+            if full or price is None:
+                raise ValueError("Data candle kosong.")
+            return [], Quote(float(price), float(quote_time or time.time()))
+        if base_seconds < 86400:
+            # Merges Yahoo's duplicate "now" point and builds 4h bars from 60m.
+            candles = resample(candles, tf.seconds)
+        return candles, Quote(float(price or candles[-1].c), float(quote_time or candles[-1].t))
 
 
 class MarketState:
-    """Holds the candle cache for one feed and merges incremental updates."""
+    """Candle cache for one (feed, timeframe) pair; merges incremental updates."""
 
-    def __init__(self, feed: Feed, cache_dir: Path):
+    def __init__(self, feed: Feed, tf: Timeframe, cache_dir: Path):
         self.feed = feed
+        self.tf = tf
         self.candles: list[Candle] = []
         self.quote: Quote | None = None
         self.last_full_sync = 0.0
         self.last_latency_ms = 0
         self.last_success = 0.0
-        self._cache_file = cache_dir / f"{feed.symbol.replace('=', '_')}.json"
+        self._cache_file = cache_dir / f"{feed.symbol.replace('=', '_')}_{tf.key}.json"
         self._load_cache()
 
     def _load_cache(self) -> None:
@@ -211,10 +279,10 @@ class MarketState:
             len(self.candles) < 300
             or now - self.last_full_sync > FULL_RESYNC_SECONDS
             # App was suspended longer than an incremental request can cover.
-            or now - self.last_success > self.feed.recent_window
+            or now - self.last_success > self.feed.recent_window(self.tf)
         )
         started = time.perf_counter()
-        fresh, quote = self.feed._fetch(full)
+        fresh, quote = self.feed.fetch(self.tf, full)
         self.last_latency_ms = int((time.perf_counter() - started) * 1000)
         if full:
             self.candles = fresh[-MAX_CANDLES:]

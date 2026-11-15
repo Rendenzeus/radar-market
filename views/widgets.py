@@ -5,9 +5,10 @@ from __future__ import annotations
 import time
 
 import flet as ft
-import flet.canvas as cv
 
 from analysis import Snapshot
+from data import DEFAULT_TIMEFRAME, TIMEFRAMES
+from views.chart import EMA20_COLOR, EMA50_COLOR, PriceChart
 
 BG = "#0A0E15"
 CARD = "#111722"
@@ -44,64 +45,6 @@ def ago(seconds: float) -> str:
     return f"{seconds // 86400} hari lalu"
 
 
-class Sparkline(ft.Container):
-    """24h close-price line drawn on a canvas, resized to its container."""
-
-    def __init__(self, height: int = 64):
-        self._series: list[float] = []
-        self._color = BLUE
-        self._size = (0.0, float(height))
-        self._canvas = cv.Canvas(expand=True, on_resize=self._on_resize, resize_interval=50)
-        super().__init__(content=self._canvas, height=height)
-
-    def _on_resize(self, e: cv.CanvasResizeEvent) -> None:
-        self._size = (e.width, e.height)
-        self._draw()
-        self._canvas.update()
-
-    def set_values(self, values: list[float], color: str) -> None:
-        self._series = values
-        self._color = color
-        self._draw()
-
-    def _draw(self) -> None:
-        w, h = self._size
-        vals = self._series
-        if w <= 0 or len(vals) < 2:
-            self._canvas.shapes = []
-            return
-        lo, hi = min(vals), max(vals)
-        span = (hi - lo) or 1.0
-        pad = 4
-        step = w / (len(vals) - 1)
-        pts = [(i * step, pad + (hi - v) / span * (h - 2 * pad)) for i, v in enumerate(vals)]
-
-        line = [cv.Path.MoveTo(*pts[0])] + [cv.Path.LineTo(x, y) for x, y in pts[1:]]
-        area = line + [cv.Path.LineTo(w, h), cv.Path.LineTo(0, h), cv.Path.Close()]
-        self._canvas.shapes = [
-            cv.Path(
-                area,
-                paint=ft.Paint(
-                    style=ft.PaintingStyle.FILL,
-                    gradient=ft.PaintLinearGradient(
-                        (0, 0), (0, h), [ft.Colors.with_opacity(0.28, self._color), ft.Colors.with_opacity(0.0, self._color)]
-                    ),
-                ),
-            ),
-            cv.Path(
-                line,
-                paint=ft.Paint(
-                    style=ft.PaintingStyle.STROKE,
-                    stroke_width=2,
-                    color=self._color,
-                    stroke_join=ft.StrokeJoin.ROUND,
-                    stroke_cap=ft.StrokeCap.ROUND,
-                ),
-            ),
-            cv.Circle(pts[-1][0], pts[-1][1], 3.5, paint=ft.Paint(color=self._color)),
-        ]
-
-
 class ScoreBar(ft.Container):
     """Diverging bar: fills left (red) for negative scores, right (green) for positive."""
 
@@ -131,16 +74,21 @@ class ScoreBar(ft.Container):
             gap.expand = max(100 - value, 1)
 
 
-def stat(label: str) -> tuple[ft.Container, ft.Text]:
+def tf_label(key: str) -> str:
+    return key.upper() if key[-1] in "hdw" else key
+
+
+def stat(label: str) -> tuple[ft.Container, ft.Text, ft.Text]:
     value = ft.Text("-", size=15, weight=ft.FontWeight.W_600, color=TEXT)
+    caption = ft.Text(label, size=11, color=MUTED)
     box = ft.Container(
-        ft.Column([ft.Text(label, size=11, color=MUTED), value], spacing=2, tight=True),
+        ft.Column([caption, value], spacing=2, tight=True),
         padding=ft.Padding.symmetric(horizontal=10, vertical=8),
         bgcolor=CARD_ALT,
         border_radius=10,
         expand=1,
     )
-    return box, value
+    return box, value, caption
 
 
 def badge(text: str, color: str) -> ft.Container:
@@ -157,15 +105,51 @@ def badge(text: str, color: str) -> ft.Container:
 
 
 class MarketCard(ft.Container):
-    def __init__(self, short: str, label: str, source: str):
+    def __init__(self, short: str, label: str, source: str, on_timeframe=None):
         self.snapshot: Snapshot | None = None
+        self.timeframe = DEFAULT_TIMEFRAME
+        self._on_timeframe = on_timeframe
         self.error: str | None = None
         self._label = label
 
         self._status = ft.Container()
         self._price = ft.Text("—", size=30, weight=ft.FontWeight.BOLD, color=TEXT)
         self._change = ft.Text("", size=13, weight=ft.FontWeight.W_600)
-        self._spark = Sparkline()
+        self._chart = PriceChart()
+        self._tf_chips: dict[str, ft.Container] = {}
+        for key in TIMEFRAMES:
+            self._tf_chips[key] = ft.Container(
+                ft.Text(tf_label(key), size=12, weight=ft.FontWeight.W_600),
+                padding=ft.Padding.symmetric(horizontal=9, vertical=5),
+                border_radius=8,
+                on_click=lambda e, k=key: self._select_tf(k),
+                data=key,
+            )
+        self._mode_btns = {
+            "candle": ft.IconButton(ft.Icons.CANDLESTICK_CHART, icon_size=18, tooltip="Candlestick", on_click=lambda e: self._select_mode("candle")),
+            "line": ft.IconButton(ft.Icons.SHOW_CHART, icon_size=18, tooltip="Garis", on_click=lambda e: self._select_mode("line")),
+        }
+        self._chart_hint = ft.Text("", size=11, color=MUTED)
+        self._paint_toolbar()
+        toolbar = ft.Row(
+            [
+                ft.Row(list(self._tf_chips.values()), spacing=2, scroll=ft.ScrollMode.AUTO, expand=True),
+                ft.Row(list(self._mode_btns.values()), spacing=0),
+            ],
+            spacing=4,
+        )
+        legend = ft.Row(
+            [
+                ft.Container(width=12, height=3, bgcolor=EMA20_COLOR, border_radius=2),
+                ft.Text("EMA20", size=11, color=MUTED),
+                ft.Container(width=12, height=3, bgcolor=EMA50_COLOR, border_radius=2),
+                ft.Text("EMA50", size=11, color=MUTED),
+                ft.Container(expand=True),
+                self._chart_hint,
+            ],
+            spacing=6,
+        )
+        self._chart_block = ft.Column([toolbar, self._chart, legend], spacing=6)
 
         self._signal = ft.Text("Memuat…", size=22, weight=ft.FontWeight.BOLD, color=MUTED)
         self._score = ft.Text("", size=13, color=MUTED)
@@ -187,10 +171,10 @@ class MarketCard(ft.Container):
             border=ft.Border.all(1, BORDER),
         )
 
-        rsi_box, self._rsi = stat("RSI 14")
-        adx_box, self._adx = stat("ADX (kekuatan)")
-        atr_box, self._atr = stat("ATR 15m")
-        trend_box, self._trend = stat("Tren 1 jam")
+        rsi_box, self._rsi, _ = stat("RSI 14")
+        adx_box, self._adx, _ = stat("ADX (kekuatan)")
+        atr_box, self._atr, self._atr_caption = stat("ATR")
+        trend_box, self._trend, self._trend_caption = stat("Tren TF besar")
 
         self._stop = ft.Text("-", size=14, weight=ft.FontWeight.W_600, color=RED)
         self._tp1 = ft.Text("-", size=14, weight=ft.FontWeight.W_600, color=GREEN)
@@ -248,7 +232,7 @@ class MarketCard(ft.Container):
                 [
                     header,
                     ft.Row([self._price, self._change], vertical_alignment=ft.CrossAxisAlignment.END, spacing=10, wrap=True),
-                    self._spark,
+                    self._chart_block,
                     self._signal_box,
                     ft.Row([rsi_box, adx_box], spacing=8),
                     ft.Row([atr_box, trend_box], spacing=8),
@@ -284,7 +268,10 @@ class MarketCard(ft.Container):
         up = snap.change_24h >= 0
         self._change.value = f"{'▲' if up else '▼'} {abs(snap.change_24h):.2f}%  24j"
         self._change.color = GREEN if up else RED
-        self._spark.set_values(snap.spark, GREEN if up else RED)
+        self._chart.set_data(snap.chart, snap.ema20, snap.ema50, snap.price, snap.tf.seconds)
+        self._chart_hint.value = f"Timeframe {tf_label(snap.tf.key)}"
+        self._atr_caption.value = f"ATR {tf_label(snap.tf.key)}"
+        self._trend_caption.value = f"Tren {tf_label(live.htf)}"
 
         closed = snap.status == "CLOSED"
         self._signal.value = live.signal
@@ -298,7 +285,7 @@ class MarketCard(ft.Container):
             self._confirm.value = "Pasar tutup — sinyal dari sesi terakhir"
         elif conf.signal == live.signal:
             self._confirm_icon.icon, self._confirm_icon.color = ft.Icons.CHECK_CIRCLE, color
-            self._confirm.value = "Terkonfirmasi di close candle 15m"
+            self._confirm.value = f"Terkonfirmasi di close candle {tf_label(snap.tf.key)}"
         else:
             self._confirm_icon.icon, self._confirm_icon.color = ft.Icons.SCHEDULE, AMBER
             self._confirm.value = f"Belum close — candle terakhir: {conf.signal} ({conf.score:+d})"
@@ -307,8 +294,8 @@ class MarketCard(ft.Container):
         self._rsi.color = RED if live.rsi > 70 else GREEN if live.rsi < 30 else TEXT
         self._adx.value = f"{live.adx:.0f} · {'sideways' if live.sideways else 'trending'}"
         self._atr.value = fmt_price(live.atr)
-        self._trend.value = {1: "▲ Naik", -1: "▼ Turun", 0: "◆ Datar"}[live.trend_1h]
-        self._trend.color = {1: GREEN, -1: RED, 0: MUTED}[live.trend_1h]
+        self._trend.value = {1: "▲ Naik", -1: "▼ Turun", 0: "◆ Datar"}[live.trend_htf]
+        self._trend.color = {1: GREEN, -1: RED, 0: MUTED}[live.trend_htf]
 
         if snap.levels and not closed:
             self._levels.visible = True
@@ -339,6 +326,31 @@ class MarketCard(ft.Container):
             )
         self._factors.controls = rows
         self.tick()
+
+    # --------------------------------------------------------------- toolbar
+    def _paint_toolbar(self) -> None:
+        for key, chip in self._tf_chips.items():
+            active = key == self.timeframe
+            chip.bgcolor = BLUE if active else None
+            chip.content.color = BG if active else MUTED
+        for mode, btn in self._mode_btns.items():
+            btn.icon_color = TEXT if mode == self._chart.mode else MUTED
+            btn.bgcolor = CARD_ALT if mode == self._chart.mode else None
+
+    def _select_tf(self, key: str) -> None:
+        if key == self.timeframe:
+            return
+        self.timeframe = key
+        self._paint_toolbar()
+        self._chart_hint.value = f"Memuat {tf_label(key)}…"
+        self.update()
+        if self._on_timeframe:
+            self._on_timeframe(self, key)
+
+    def _select_mode(self, mode: str) -> None:
+        self._chart.set_mode(mode)
+        self._paint_toolbar()
+        self.update()
 
     def show_error(self, message: str) -> None:
         self.error = message

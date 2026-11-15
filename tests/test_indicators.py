@@ -70,6 +70,22 @@ class SignalTests(unittest.TestCase):
         self.assertEqual(label_for(-30), "SELL")
         self.assertEqual(label_for(-61), "STRONG SELL")
 
+    def test_every_timeframe_evaluates(self):
+        from data import TIMEFRAMES
+        for tf in TIMEFRAMES.values():
+            candles = synthetic_candles(1000, drift=0.001)
+            candles = [Candle(i * tf.seconds, c.o, c.h, c.l, c.c, c.v) for i, c in enumerate(candles)]
+            ev = evaluate(candles, tf)
+            self.assertGreater(ev.score, 0, tf.key)
+            self.assertEqual(ev.htf, tf.htf_key)
+
+    def test_resample_aggregates_ohlcv(self):
+        from data import resample
+        bars = [Candle(0, 1, 5, 0.5, 2, 10), Candle(60, 2, 3, 1, 4, 5), Candle(120, 4, 4, 3, 3, 1)]
+        out = resample(bars, 120)
+        self.assertEqual(out[0], Candle(0, 1, 5, 0.5, 4, 15))
+        self.assertEqual(out[1], Candle(120, 4, 4, 3, 3, 1))
+
     def test_evaluate_is_fast(self):
         candles = synthetic_candles(1200)
         start = time.perf_counter()

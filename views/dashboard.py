@@ -9,7 +9,7 @@ from datetime import datetime
 import flet as ft
 
 from analysis import build_snapshot
-from data import FEEDS, MarketState, default_cache_dir
+from data import FEEDS, TIMEFRAMES, Feed, MarketState, default_cache_dir
 from views.widgets import BG, BORDER, MUTED, TEXT, MarketCard, signal_color
 
 CACHE_SAVE_SECONDS = 5 * 60
@@ -18,10 +18,14 @@ CLOSED_MARKET_REFRESH = 5 * 60
 
 class MarketDashboard(ft.Column):
     def __init__(self):
-        cache_dir = default_cache_dir()
-        self._states = [MarketState(feed, cache_dir) for feed in FEEDS]
-        self._cards = {s.feed.symbol: MarketCard(s.feed.short, s.feed.label, s.feed.source) for s in self._states}
-        self._busy: set[str] = set()
+        self._cache_dir = default_cache_dir()
+        self._feeds = {feed.symbol: feed for feed in FEEDS}
+        self._states: dict[tuple[str, str], MarketState] = {}
+        self._cards = {
+            feed.symbol: MarketCard(feed.short, feed.label, feed.source, on_timeframe=self._on_timeframe)
+            for feed in FEEDS
+        }
+        self._busy: set[tuple[str, str]] = set()
         self._last_alert: dict[str, str] = {}
         self._last_save = time.time()
         self._wake: dict[str, asyncio.Event] = {}
@@ -34,7 +38,7 @@ class MarketDashboard(ft.Column):
                 ft.Column(
                     [
                         ft.Text("Market Radar", size=22, weight=ft.FontWeight.BOLD, color=TEXT),
-                        ft.Text("Sinyal teknikal XAU & BTC · timeframe 15m + konfirmasi 1j", size=12, color=MUTED),
+                        ft.Text("Sinyal teknikal XAU & BTC · pilih timeframe 1m–1D di tiap kartu", size=12, color=MUTED),
                     ],
                     spacing=2,
                     expand=True,
@@ -60,26 +64,46 @@ class MarketDashboard(ft.Column):
         )
 
     # ----------------------------------------------------------- lifecycle
+    def _state(self, symbol: str) -> MarketState:
+        """MarketState for the timeframe currently selected on the symbol's card."""
+        key = (symbol, self._cards[symbol].timeframe)
+        if key not in self._states:
+            self._states[key] = MarketState(self._feeds[symbol], TIMEFRAMES[key[1]], self._cache_dir)
+        return self._states[key]
+
+    def _show_cached(self, symbol: str) -> None:
+        state = self._state(symbol)
+        if state.candles:
+            try:
+                self._cards[symbol].show(build_snapshot(state))
+            except Exception:
+                pass
+
     def start(self) -> None:
         # Render cached candles immediately so the app is useful before the network answers.
-        for state in self._states:
-            if state.candles:
-                try:
-                    self._cards[state.feed.symbol].show(build_snapshot(state))
-                except Exception:
-                    pass
+        for symbol in self._feeds:
+            self._show_cached(symbol)
         self.page.update()
-        for state in self._states:
-            self._wake[state.feed.symbol] = asyncio.Event()
-            self.page.run_task(self._market_loop, state)
+        self._loop = asyncio.get_running_loop()
+        for symbol in self._feeds:
+            self._wake[symbol] = asyncio.Event()
+            self.page.run_task(self._market_loop, symbol)
         self.page.run_task(self._ticker)
 
-    async def _market_loop(self, state: MarketState) -> None:
-        wake = self._wake[state.feed.symbol]
+    def _on_timeframe(self, card: MarketCard, key: str) -> None:
+        symbol = next(s for s, c in self._cards.items() if c is card)
+        self._show_cached(symbol)
+        card.update()
+        # Click handlers may run on a worker thread; asyncio.Event is not thread-safe.
+        self._loop.call_soon_threadsafe(self._wake[symbol].set)
+
+    async def _market_loop(self, symbol: str) -> None:
+        wake = self._wake[symbol]
+        feed: Feed = self._feeds[symbol]
+        card = self._cards[symbol]
         while True:
-            await self._refresh_one(state)
-            card = self._cards[state.feed.symbol]
-            delay = state.feed.refresh_seconds
+            await self._refresh_one(self._state(symbol))
+            delay = feed.refresh_seconds
             if card.snapshot and card.snapshot.status == "CLOSED":
                 delay = CLOSED_MARKET_REFRESH
             elif card.error:
@@ -92,24 +116,27 @@ class MarketDashboard(ft.Column):
 
     async def _refresh_one(self, state: MarketState) -> None:
         symbol = state.feed.symbol
-        if symbol in self._busy:
+        key = (symbol, state.tf.key)
+        if key in self._busy:
             return
-        self._busy.add(symbol)
+        self._busy.add(key)
         card = self._cards[symbol]
         try:
             await asyncio.to_thread(state.refresh)
             snap = await asyncio.to_thread(build_snapshot, state)
-            card.show(snap)
+            if card.timeframe == state.tf.key:  # user may have switched meanwhile
+                card.show(snap)
             self._maybe_alert(snap)
         except Exception as exc:
-            card.show_error(_friendly_error(exc))
+            if card.timeframe == state.tf.key:
+                card.show_error(_friendly_error(exc))
         finally:
-            self._busy.discard(symbol)
+            self._busy.discard(key)
         card.update()
 
         if time.time() - self._last_save > CACHE_SAVE_SECONDS:
             self._last_save = time.time()
-            for s in self._states:
+            for s in list(self._states.values()):
                 await asyncio.to_thread(s.save_cache)
 
     async def _ticker(self) -> None:
@@ -121,15 +148,15 @@ class MarketDashboard(ft.Column):
                 card.update()
             await asyncio.sleep(1)
 
-    async def _refresh_all(self, e=None) -> None:
-        for state in self._states:
-            state.last_full_sync = 0  # force a clean resync on manual refresh
-            self._wake[state.feed.symbol].set()
+    def _refresh_all(self, e=None) -> None:
+        for symbol in self._feeds:
+            self._state(symbol).last_full_sync = 0  # force a clean resync on manual refresh
+            self._loop.call_soon_threadsafe(self._wake[symbol].set)
 
     # --------------------------------------------------------------- alerts
     def _maybe_alert(self, snap) -> None:
         """Alert only on signals confirmed by a closed candle, so they never repaint."""
-        symbol = snap.feed.symbol
+        symbol = (snap.feed.symbol, snap.tf.key)
         signal = snap.confirmed.signal
         previous = self._last_alert.get(symbol)
         self._last_alert[symbol] = signal
@@ -138,7 +165,7 @@ class MarketDashboard(ft.Column):
         if signal in {"STRONG BUY", "STRONG SELL"}:
             self.page.show_dialog(
                 ft.SnackBar(
-                    ft.Text(f"{snap.feed.label}: {signal} di {snap.price:,.2f} (skor {snap.confirmed.score:+d})", color=BG),
+                    ft.Text(f"{snap.feed.label} {snap.tf.key}: {signal} di {snap.price:,.2f} (skor {snap.confirmed.score:+d})", color=BG),
                     bgcolor=signal_color(signal),
                     duration=ft.Duration(seconds=8),
                 )
