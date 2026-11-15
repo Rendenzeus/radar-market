@@ -94,5 +94,23 @@ Perkiraan jumlah trade dari backtest: ±37 per tahun di 4h dan ±6 per tahun di 
 6–8 minggu hanya menghasilkan ±5 trade. Itu cukup untuk menguji eksekusi (fill, slippage,
 swap, disiplin), tapi tidak cukup untuk membuktikan sinyal.
 
+Jam candle di MT5 mengikuti jam server broker (MetaQuotes-Demo: UTC+2, UTC+3 saat musim
+panas Eropa). Skrip mempelajari selisih jam itu dari harga live, dan tidak membuka posisi
+selama selisihnya belum diketahui (misalnya baru dinyalakan saat akhir pekan). Sinyal dari
+candle Jumat terakhir hanya bisa dieksekusi sebelum pasar tutup; setelah itu tercatat `missed`.
+
+## Ekspor data (`tools/mt5_export.py`)
+
+Menyimpan candle dari terminal ke CSV supaya bisa diuji tanpa MT5:
+
+```bash
+python tools/mt5_export.py XAUUSD H1,H4,D1
+```
+
+Hasilnya di `tools/.history/XAUUSD_H4.csv` dan seterusnya (tidak masuk git). Kolom: `time`
+(epoch detik, jam server broker), `open`, `high`, `low`, `close`, `volume` (tick), `spread`
+(poin). Candle terakhir sesi yang belum genap periodenya (misalnya H4 Jumat yang terpotong
+saat pasar tutup) baru ikut setelah sesi berikutnya dibuka.
+
 Kripto tidak bisa diuji di sini: server MetaQuotes-Demo tidak punya CFD BTCUSD, ETHUSD, dan
 sejenisnya (simbol "BTC", "ETH" di sana adalah saham/ETF).

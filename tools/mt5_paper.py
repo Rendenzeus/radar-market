@@ -6,7 +6,8 @@ Follows the v2 rules from signals.run_strategy on the broker's own candles:
     not a demo account, nothing is sent and the script stops
   - entries only when the script itself saw the candle close: the breakout candle
     must have become the last closed candle between two consecutive passes no more
-    than FRESH_SECONDS apart. A signal found any later (script started after the
+    than FRESH_SECONDS apart, and the broker clock (learned from live ticks) must
+    put that close less than FRESH_SECONDS ago. A signal found any later (script started after the
     close, terminal disconnected, laptop asleep) is logged as "missed"
   - one attempt per entry; a rejected order is logged once and then as "missed"
   - the 2 x ATR stop is placed on the order (the broker enforces it)
@@ -134,11 +135,31 @@ def trading_enabled() -> bool:
     return bool(term and term.trade_allowed)
 
 
-def closed_candles(tf: int) -> list[Candle] | None:
-    rates = mt5.copy_rates_from_pos(SYMBOL, tf, 1, BARS)  # position 0 is the forming candle
+def server_offset(state: dict) -> int | None:
+    """Broker clock minus local clock, rounded to 30 min; learned from a fresh tick.
+
+    Candle times are in the broker's server time. The offset is only (re)learned
+    while quotes are live, so a closed market keeps the last known value.
+    """
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is not None and tick.time:
+        guess = round((tick.time - time.time()) / 1800) * 1800
+        if abs(time.time() + guess - tick.time) < 120:
+            state["offset"] = guess
+    return state.get("offset")
+
+
+def closed_candles(tf: int, seconds: int, server_now: float | None) -> list[Candle] | None:
+    """Closed candles only. With a known server clock, the newest bar counts as closed
+    once its period is over (e.g. Friday's bars over a weekend); without it, the newest
+    bar is always treated as forming."""
+    rates = mt5.copy_rates_from_pos(SYMBOL, tf, 0, BARS + 1)
     if rates is None or not len(rates):
         return None
-    return [Candle(int(r["time"]), float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"]), float(r["tick_volume"])) for r in rates]
+    candles = [Candle(int(r["time"]), float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"]), float(r["tick_volume"])) for r in rates]
+    if server_now is None:
+        return candles[:-1]
+    return [c for c in candles if c.t + seconds <= server_now]
 
 
 def position(ticket: int):
@@ -240,9 +261,11 @@ def step(start: int, state: dict) -> None:
     prev_pass = state.get("prev_pass", 0.0)
     state["prev_pass"] = now
     contiguous = now - prev_pass <= FRESH_SECONDS
+    offset = server_offset(state)
+    server_now = None if offset is None else now + offset
 
     for tf_key, (tf, seconds, magic) in TIMEFRAMES.items():
-        candles = closed_candles(tf)
+        candles = closed_candles(tf, seconds, server_now)
         if candles is None:
             log_error(("data", tf_key), tf=tf_key, action="data", message=str(mt5.last_error()))
             state["prev"].pop(tf_key, None)
@@ -268,7 +291,16 @@ def step(start: int, state: dict) -> None:
             continue
         if logged("missed", tf_key, plan.opened_t) or open_rows(tf_key):
             continue
-        seen_live = plan.opened_t == last_t and previous_last is not None and previous_last != last_t and contiguous
+        # Seen live: the close happened between two close-together passes, and the broker clock
+        # confirms it was moments ago (unknown clock: no entries at all).
+        seen_live = (
+            plan.opened_t == last_t
+            and previous_last is not None
+            and previous_last != last_t
+            and contiguous
+            and server_now is not None
+            and server_now - (last_t + seconds) <= FRESH_SECONDS
+        )
         if not seen_live:
             log("missed", tf=tf_key, opened_t=plan.opened_t, direction=plan.direction,
                 note="close candle tidak terlihat langsung oleh skrip (baru jalan, terputus, atau laptop tidur)")

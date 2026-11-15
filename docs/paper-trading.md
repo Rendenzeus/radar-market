@@ -6,12 +6,19 @@ dan menulis jurnal append-only: satu baris JSON per kejadian, tidak pernah ditul
 | Jalur | Pasar | Eksekusi | Jurnal |
 |---|---|---|---|
 | App (dashboard) | 5 kripto 4h/1D, Gold 1D | Harga close candle sinyal, tanpa fill | `<data app>/journal.jsonl` |
-| `tools/binance_paper.py` | BTC, ETH, BNB, SOL, XRP 4h/1D | Simulasi fill di bid/ask live Binance + fee 0,1%/sisi | `~/.market-radar/binance_paper.jsonl` |
+| `tools/binance_paper.py` | **Uji v3** ([signal-v3.md](signal-v3.md)): BTC, ETH, BNB, SOL, XRP 4h/1D, BUY saja | Simulasi fill di bid/ask live Binance + fee 0,1%/sisi | `~/.market-radar/binance_paper.jsonl` |
 | `tools/mt5_paper.py` | XAUUSD 4h/1D | Order asli di akun demo MT5 (lihat [mt5.md](mt5.md)) | `~/.market-radar/mt5_paper.jsonl` |
 
 ## `tools/binance_paper.py`
 
-Tidak mengirim order ke mana pun.
+Ini uji resmi v3 (v2 long-only), terdaftar sebelum mulai. Tidak mengirim order ke mana pun.
+
+- **Aturan berhenti:** kalau kurva gabungan semua trade v3 turun lebih dari 50R dari
+  puncaknya, skrip berhenti membuka posisi baru dan mencatat `stop_rule`. Posisi terbuka
+  tetap dikelola sampai selesai.
+- **Penilaian:** setelah 150 trade 4h selesai atau 15 Mar 2028. `--status` menampilkan
+  progresnya (trade 4h, drawdown terhadap batas 50R, rasio `missed`).
+- Baris v2 lama di jurnal tetap ada tapi diabaikan (kolom `version`).
 
 - **Entry:** hanya kalau skrip sendiri melihat candle breakout close (candle itu berubah jadi
   candle close terakhir di antara dua putaran yang jaraknya paling lama 2 menit). Fill
@@ -22,8 +29,6 @@ Tidak mengirim order ke mana pun.
   dan ada candle yang menembus stop, trade ditutup di harga stop (`from_candle`).
 - **Keluar trailing:** saat aturan keluar di candle close, fill di bid/ask live setelah close.
 - **Hasil:** R dihitung dari fill entry yang sebenarnya, dikurangi fee kedua sisi.
-- **SELL:** disimulasikan seolah bisa short (futures/margin). Di spot hanya BUY yang bisa
-  dijalankan, jadi `--status` juga menampilkan total BUY saja.
 
 ```bash
 python tools/binance_paper.py
@@ -33,8 +38,8 @@ python tools/binance_paper.py
 python tools/binance_paper.py --status
 ```
 
-Mulai 15 Nov 2026 (BTC 22:25, empat koin lain 22:42). Posisi yang sudah dipegang aturan
-sebelum itu tidak diikuti, jadi trade pertama menunggu breakout baru.
+v3 mulai 15 Nov 2026 22:55. Posisi yang sudah dipegang aturan sebelum itu tidak diikuti,
+jadi trade pertama menunggu breakout baru.
 
 ## Kapan harus menyala
 
