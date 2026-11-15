@@ -1,157 +1,137 @@
-"""Closed-candle signal engine with hysteresis and a locked trade plan.
+"""Signal v2: Donchian breakout with a trend filter on large timeframes.
 
-State machine, evaluated once per CLOSED candle (never on the forming one):
+Spec (fixed before testing, see docs/signal-v2.md):
+  long  when close > highest high of the previous 20 candles and close > EMA200
+  short when close < lowest low  of the previous 20 candles and close < EMA200
+  entry at the close of the breakout candle
+  stop  2 x ATR(14) from entry, locked; checked with high/low on later candles,
+        filled at the open when a candle gaps through it
+  exit  long: close < lowest low of the previous 10 candles (short mirrored),
+        filled at that close; no profit target
+  one position at a time; a new entry needs a new breakout after the exit
 
-  FLAT  --|score| >= ENTER, ADX gate open, plan R:R >= MIN_RR-->  LONG / SHORT
-  LONG/SHORT --stop hit / TP2 hit / |score| < EXIT / score flips-->  FLAT
-
-When a position opens, entry (= close of the signal candle), stop and targets
-are LOCKED and never recomputed:
-  stop  = beyond the most recent swing high/low + 0.25 ATR (structure, not a
-          fixed ATR multiple), at least 0.5 ATR away; reject if > 4 ATR
-  TP1   = nearest support/resistance in the trade direction, or 2R if none;
-          the signal is rejected when TP1 is below MIN_RR (1.5R)
-  TP2   = next level beyond TP1, at least TP1 + 1R (3R if none)
-Management: half off at TP1 and the stop moves to entry, rest runs to TP2.
-Results are measured in R (multiples of the initial risk). ``net_r`` subtracts the
-round-trip trading cost expressed in R (cost_pct * entry / risk); the R:R filter
-and all statistics use the net figure.
-
-On start-up the engine replays the last REPLAY_BARS closed candles, so the
-current state does not depend on when the app was opened, and those replayed
-trades double as a rolling performance record.
+Results are in R (1R = the 2 x ATR stop distance) minus the round-trip cost in R.
+The composite score in analysis.py is shown as context only; it no longer trades.
 """
 
 from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from analysis import ENTER, EXIT, MIN_CANDLES, STRONG, Evaluation, evaluate
+from analysis import MIN_CANDLES, Evaluation, evaluate
 from data import Candle, MarketState, Timeframe
-from indicators import pivots
+from indicators import atr_series, ema_series
 
-WINDOW = 900  # candles per evaluation (enough for the higher-timeframe EMA50)
-REPLAY_BARS = 200
-MIN_RR = 1.5
-STOP_BUFFER_ATR = 0.25
-MIN_RISK_ATR = 0.5
-MAX_RISK_ATR = 4.0
+ENTRY_N = 20
+EXIT_N = 10
+TREND_EMA = 200
+STOP_ATR = 2.0
+EVAL_WINDOW = 900  # candles for the context score
+
+SIGNAL_TIMEFRAMES_TEXT = {14400: "4 jam dan 1 hari", 86400: "1 hari"}
 
 
 @dataclass
 class TradePlan:
     direction: int  # +1 long, -1 short
-    opened_t: int  # open time of the signal candle
+    opened_t: int  # open time of the breakout candle
     entry: float
-    stop: float  # current stop (moves to entry after TP1)
-    initial_stop: float
-    tp1: float
-    tp2: float
-    rr1: float
-    rr2: float
-    status: str = "OPEN"  # OPEN | TP1 | CLOSED
+    stop: float  # initial stop, never moved
+    risk: float  # entry-to-stop distance (1R)
+    cost_r: float  # round-trip cost in R
+    trail: float | None = None  # exit if a candle closes beyond this level
+    status: str = "OPEN"  # OPEN | CLOSED
     closed_t: int | None = None
-    exit_reason: str | None = None  # SL | BE | TP2 | SIGNAL
-    result_r: float | None = None  # gross, before costs
-    cost_r: float = 0.0  # round-trip cost in R
-
-    @property
-    def risk(self) -> float:
-        return abs(self.entry - self.initial_stop)
+    exit_price: float | None = None
+    exit_reason: str | None = None  # SL | TRAIL
+    result_r: float | None = None  # gross
 
     @property
     def net_r(self) -> float | None:
         return None if self.result_r is None else round(self.result_r - self.cost_r, 3)
+
+    def open_r(self, price: float) -> float:
+        """Unrealised result at ``price``, net of costs."""
+        return (price - self.entry) * self.direction / self.risk - self.cost_r
 
 
 @dataclass
 class SignalState:
     label: str = "WAIT"
     plan: TradePlan | None = None
-    rejection: str | None = None  # why the last qualifying candle was not taken
-    rejection_t: int | None = None
-    history: list[TradePlan] = field(default_factory=list)  # closed trades in the replay window
-    last_t: int | None = None  # last processed closed candle
-    gated: bool = False
-    disabled: str | None = None  # why this feed/timeframe issues no signals at all
+    history: list[TradePlan] = field(default_factory=list)  # closed trades in the loaded data
+    last_t: int | None = None
+    disabled: str | None = None
+    bars: int = 0  # candles the history covers
 
     def results(self) -> list[float]:
-        """Net R of closed trades in the replay window, oldest first."""
         return [p.net_r for p in self.history if p.net_r is not None]
 
     def stats(self) -> tuple[int, int, float]:
-        """(trades, wins, average net R) over closed trades."""
+        """(trades, wins, average net R)."""
         done = self.results()
         if not done:
             return 0, 0, 0.0
         return len(done), sum(1 for r in done if r > 0), sum(done) / len(done)
 
 
-def build_plan(
-    window: list[Candle], ev: Evaluation, direction: int, cost_pct: float = 0.0
-) -> tuple[TradePlan | None, str | None]:
-    """Structure-based plan for a signal on the last candle of ``window``."""
-    entry = window[-1].c
-    atr = ev.atr
-    if not atr:
-        return None, "ATR tidak tersedia"
-    highs = [c.h for c in window]
-    lows = [c.l for c in window]
-    ph, pl = pivots(highs, lows, k=3, lookback=40)
-
-    if direction < 0:
-        swings = [highs[i] for i in reversed(ph) if highs[i] > entry]
-        anchor = swings[0] if swings else max(highs[-10:])
-        stop = max(anchor + STOP_BUFFER_ATR * atr, entry + MIN_RISK_ATR * atr)
-        levels = [s for s in ev.supports if entry - s >= 0.2 * atr]
-    else:
-        swings = [lows[i] for i in reversed(pl) if lows[i] < entry]
-        anchor = swings[0] if swings else min(lows[-10:])
-        stop = min(anchor - STOP_BUFFER_ATR * atr, entry - MIN_RISK_ATR * atr)
-        levels = [r for r in ev.resistances if r - entry >= 0.2 * atr]
-
-    risk = abs(entry - stop)
-    if risk > MAX_RISK_ATR * atr:
-        return None, f"Stop struktur terlalu jauh ({risk / atr:.1f}× ATR)"
-
-    cost_r = cost_pct * entry / risk
-    tp1 = levels[0] if levels else entry + direction * 2 * risk
-    rr1 = abs(tp1 - entry) / risk
-    if rr1 - cost_r < MIN_RR:
-        name = "support" if direction < 0 else "resistance"
-        return None, f"R:R TP1 setelah biaya cuma {rr1 - cost_r:.1f} (< {MIN_RR}): {name} {tp1:,.2f} terlalu dekat"
-
-    beyond = [lv for lv in levels[1:] if abs(lv - entry) >= abs(tp1 - entry) + risk]
-    tp2 = beyond[0] if beyond else entry + direction * max(3 * risk, abs(tp1 - entry) + risk)
-    rr2 = abs(tp2 - entry) / risk
-    plan = TradePlan(
-        direction, window[-1].t, entry, stop, stop, tp1, tp2, round(rr1, 2), round(rr2, 2), cost_r=round(cost_r, 3)
-    )
-    return plan, None
-
-
-def manage(plan: TradePlan, bar: Candle) -> TradePlan:
-    """Advance an open plan through one closed candle (stop checked first: conservative)."""
-    d = plan.direction
-    hit_stop = bar.h >= plan.stop if d < 0 else bar.l <= plan.stop
-    if hit_stop:
-        if plan.status == "TP1":
-            return replace(plan, status="CLOSED", closed_t=bar.t, exit_reason="BE", result_r=round(0.5 * plan.rr1, 2))
-        return replace(plan, status="CLOSED", closed_t=bar.t, exit_reason="SL", result_r=-1.0)
-    if plan.status == "OPEN" and (bar.l <= plan.tp1 if d < 0 else bar.h >= plan.tp1):
-        plan = replace(plan, status="TP1", stop=plan.entry)
-    if plan.status == "TP1" and (bar.l <= plan.tp2 if d < 0 else bar.h >= plan.tp2):
-        return replace(plan, status="CLOSED", closed_t=bar.t, exit_reason="TP2", result_r=round(0.5 * plan.rr1 + 0.5 * plan.rr2, 2))
+def _close(plan: TradePlan, bar: Candle, price: float, reason: str) -> TradePlan:
+    plan.status, plan.closed_t, plan.exit_price, plan.exit_reason = "CLOSED", bar.t, price, reason
+    plan.result_r = round((price - plan.entry) * plan.direction / plan.risk, 3)
     return plan
 
 
-def close_on_signal(plan: TradePlan, bar: Candle) -> TradePlan:
-    move = (bar.c - plan.entry) * plan.direction / plan.risk
-    result = 0.5 * plan.rr1 + 0.5 * move if plan.status == "TP1" else move
-    return replace(plan, status="CLOSED", closed_t=bar.t, exit_reason="SIGNAL", result_r=round(result, 2))
+def run_strategy(
+    candles: list[Candle], cost_pct: float = 0.0, allow_short: bool = True
+) -> tuple[list[TradePlan], TradePlan | None]:
+    """Run the rules over closed candles. Returns (closed trades, open position)."""
+    n = len(candles)
+    highs = [c.h for c in candles]
+    lows = [c.l for c in candles]
+    closes = [c.c for c in candles]
+    ema = ema_series(closes, TREND_EMA)
+    atr = atr_series(highs, lows, closes)
+    trades: list[TradePlan] = []
+    plan: TradePlan | None = None
+
+    for i in range(max(TREND_EMA, ENTRY_N), n):
+        bar = candles[i]
+        if plan is not None:
+            d = plan.direction
+            if d > 0 and bar.l <= plan.stop:
+                trades.append(_close(plan, bar, min(bar.o, plan.stop), "SL"))
+            elif d < 0 and bar.h >= plan.stop:
+                trades.append(_close(plan, bar, max(bar.o, plan.stop), "SL"))
+            elif (d > 0 and bar.c < min(lows[i - EXIT_N : i])) or (d < 0 and bar.c > max(highs[i - EXIT_N : i])):
+                trades.append(_close(plan, bar, bar.c, "TRAIL"))
+            else:
+                plan.trail = min(lows[i - EXIT_N + 1 : i + 1]) if d > 0 else max(highs[i - EXIT_N + 1 : i + 1])
+                continue
+            plan = None
+            continue  # no entry on the exit candle
+
+        if ema[i] is None or not atr[i]:
+            continue
+        d = 0
+        if bar.c > max(highs[i - ENTRY_N : i]) and bar.c > ema[i]:
+            d = 1
+        elif allow_short and bar.c < min(lows[i - ENTRY_N : i]) and bar.c < ema[i]:
+            d = -1
+        if d:
+            risk = STOP_ATR * atr[i]
+            plan = TradePlan(
+                d,
+                bar.t,
+                bar.c,
+                bar.c - d * risk,
+                risk,
+                round(cost_pct * bar.c / risk, 3),
+                trail=min(lows[i - EXIT_N + 1 : i + 1]) if d > 0 else max(highs[i - EXIT_N + 1 : i + 1]),
+            )
+    return trades, plan
 
 
 class SignalEngine:
@@ -170,85 +150,81 @@ class SignalEngine:
         self.last_eval: Evaluation | None = None
         self._journal = journal
         self._symbol = symbol
-
-    def _step(self, window: list[Candle]) -> None:
-        bar = window[-1]
-        ev = evaluate(window, self.tf)
-        self.last_eval = ev
-        st = self.state
-        st.gated = ev.sideways
-
-        if st.plan is not None:
-            if bar.t > st.plan.opened_t:
-                st.plan = manage(st.plan, bar)
-            if st.plan.status != "CLOSED":
-                d = st.plan.direction
-                if ev.score * d < EXIT:  # weakened below the exit band or flipped
-                    st.plan = close_on_signal(st.plan, bar)
-            if st.plan.status == "CLOSED":
-                st.history.append(st.plan)
-                self._record(st.plan)
-                st.plan = None
-
-        if st.plan is None and not self.disabled and not ev.sideways and abs(ev.score) >= ENTER:
-            direction = 1 if ev.score > 0 else -1
-            plan, reason = build_plan(window, ev, direction, self.cost_pct)
-            if plan:
-                st.plan = plan
-                st.rejection = None
-            else:
-                st.rejection, st.rejection_t = f"{'BUY' if direction > 0 else 'SELL'} ditolak: {reason}", bar.t
-
-        if st.plan is not None:
-            strong = ev.score * st.plan.direction >= STRONG
-            st.label = ("STRONG " if strong else "") + ("BUY" if st.plan.direction > 0 else "SELL")
-        else:
-            st.label = "WAIT"
-        st.last_t = bar.t
+        self._started = time.time()
+        self._logged: set[tuple] = set()
 
     def update(self, closed: list[Candle]) -> SignalState:
-        """Process every closed candle not seen yet."""
-        times = [c.t for c in closed]
-        st = self.state
-        if st.last_t is not None and st.last_t not in set(times):
-            self.state = st = SignalState(disabled=self.disabled)  # history gap: replay from scratch
-        if st.last_t is None:
-            start = max(MIN_CANDLES - 1, len(closed) - REPLAY_BARS)
-        else:
-            start = times.index(st.last_t) + 1
-        for i in range(start, len(closed)):
-            self._step(closed[max(0, i + 1 - WINDOW) : i + 1])
-        st.history = st.history[-100:]
+        """Re-run the rules when a new candle has closed."""
+        if not closed or closed[-1].t == self.state.last_t:
+            return self.state
+        if len(closed) >= MIN_CANDLES:
+            self.last_eval = evaluate(closed[-EVAL_WINDOW:], self.tf)
+        st = SignalState(disabled=self.disabled, last_t=closed[-1].t, bars=len(closed))
+        if not self.disabled:
+            trades, plan = run_strategy(closed, self.cost_pct)
+            st.history, st.plan = trades, plan
+            st.label = "WAIT" if plan is None else ("BUY" if plan.direction > 0 else "SELL")
+            self._log_live(trades, plan)
+        self.state = st
         return st
 
     # ------------------------------------------------------------ journal
-    def _record(self, plan: TradePlan) -> None:
-        if self._journal is None:
+    def _is_live(self, t: int) -> bool:
+        """True for an event on a candle that closed after the app started."""
+        return t + self.tf.seconds >= self._started
+
+    def _log_live(self, trades: list[TradePlan], plan: TradePlan | None) -> None:
+        if plan is not None and self._is_live(plan.opened_t):
+            self._append("open", plan)
+        for p in trades:
+            if self._is_live(p.closed_t):
+                self._append("close", p)
+
+    def _append(self, event: str, plan: TradePlan) -> None:
+        """Append-only log, one JSON object per line, each event written once."""
+        key = (event, plan.opened_t)
+        if self._journal is None or key in self._logged:
             return
-        try:
-            rows = json.loads(self._journal.read_text("utf-8")) if self._journal.exists() else []
-        except Exception:
-            rows = []
-        key = (self._symbol, self.tf.key, plan.opened_t)
-        if any((r.get("symbol"), r.get("tf"), r.get("opened_t")) == key for r in rows):
-            return
-        rows.append(
-            {"symbol": self._symbol, "tf": self.tf.key, "recorded_at": int(time.time()), **asdict(plan), "net_r": plan.net_r}
-        )
+        self._logged.add(key)
+        row = {
+            "event": event,
+            "symbol": self._symbol,
+            "tf": self.tf.key,
+            "logged_at": int(time.time()),
+            "version": 2,
+            **asdict(plan),
+            "net_r": plan.net_r,
+        }
         try:
             self._journal.parent.mkdir(parents=True, exist_ok=True)
-            self._journal.write_text(json.dumps(rows[-2000:], separators=(",", ":")), "utf-8")
+            if not _already_logged(self._journal, row):
+                with self._journal.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row, separators=(",", ":")) + "\n")
         except Exception:
             pass
 
 
-def journal_stats(path: Path, symbol: str, tf_key: str) -> tuple[int, int, float]:
-    """(trades, wins, average net R) from the on-disk journal."""
+def _key(r: dict) -> tuple:
+    return r.get("event"), r.get("symbol"), r.get("tf"), r.get("opened_t")
+
+
+def _already_logged(path: Path, row: dict) -> bool:
+    """Guards against a second app session logging the same event again."""
+    if not path.exists():
+        return False
     try:
-        rows = [r for r in json.loads(path.read_text("utf-8")) if r["symbol"] == symbol and r["tf"] == tf_key]
+        return any(_key(json.loads(line)) == _key(row) for line in path.read_text("utf-8").splitlines() if line.strip())
+    except Exception:
+        return False
+
+
+def journal_stats(path: Path, symbol: str, tf_key: str) -> tuple[int, int, float]:
+    """(trades, wins, average net R) of live-logged closed trades."""
+    try:
+        rows = [json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
     except Exception:
         return 0, 0, 0.0
-    net = [r.get("net_r", r["result_r"] - r.get("cost_r", 0.0)) for r in rows]
+    net = [r["net_r"] for r in rows if r.get("event") == "close" and r.get("symbol") == symbol and r.get("tf") == tf_key]
     if not net:
         return 0, 0, 0.0
     return len(net), sum(1 for r in net if r > 0), sum(net) / len(net)
@@ -260,10 +236,11 @@ def engine_for(state: MarketState) -> SignalEngine:
         feed = state.feed
         disabled = None
         if state.tf.seconds < feed.min_signal_seconds:
+            allowed = SIGNAL_TIMEFRAMES_TEXT.get(feed.min_signal_seconds, "timeframe besar")
             disabled = (
-                "Sinyal dimatikan di timeframe ini: riwayat data intraday terlalu pendek untuk diuji "
-                "(Yahoo hanya ±60 hari). Pakai 1 jam ke atas."
+                f"Sinyal hanya di timeframe {allowed}. Di timeframe kecil biaya dan noise terlalu "
+                "besar: uji v1 di 15m rugi ±0,5R per trade setelah biaya. Chart dan skor konteks tetap tampil."
             )
-        engine = SignalEngine(state.tf, state.cache_dir / "journal.json", feed.symbol, feed.cost_pct, disabled)
+        engine = SignalEngine(state.tf, state.cache_dir / "journal.jsonl", feed.symbol, feed.cost_pct, disabled)
         state.engine = engine
     return engine

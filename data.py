@@ -168,6 +168,8 @@ class BinanceFeed(Feed):
         # Binance spot Regular User: 0.10% maker/taker per side + ~0.03% slippage per side.
         self.cost_pct = 2 * (0.0010 + 0.0003)
         self.cost_note = "biaya 0,1%/sisi + slippage 0,03%/sisi"
+        self.min_signal_seconds = 4 * 3600
+        self.default_timeframe = "4h"
         self.refresh_seconds = 3
         self._host = self.HOSTS[0]
 
@@ -248,9 +250,10 @@ class YahooFeed(Feed):
         # Rough futures/CFD cost (spread + commission + slippage); an assumption.
         self.cost_pct = 0.0003
         self.cost_note = "asumsi biaya+slippage 0,03% pulang-pergi"
-        # Yahoo keeps only ~60 days of 15m/30m bars but ~730 days of 1h bars.
-        self.min_signal_seconds = 3600
-        self.default_timeframe = "1h"
+        # Yahoo keeps only ~60 days of 15m/30m bars and ~730 days of 1h bars; the
+        # signal is tested on daily bars only.
+        self.min_signal_seconds = 86400
+        self.default_timeframe = "1d"
 
     def recent_window(self, tf: Timeframe) -> float:
         return {"1d": 20 * 86400, "1h": 3 * 86400, "4h": 3 * 86400}.get(tf.key, 12 * 3600)
