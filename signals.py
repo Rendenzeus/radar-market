@@ -13,7 +13,9 @@ are LOCKED and never recomputed:
           the signal is rejected when TP1 is below MIN_RR (1.5R)
   TP2   = next level beyond TP1, at least TP1 + 1R (3R if none)
 Management: half off at TP1 and the stop moves to entry, rest runs to TP2.
-Results are measured in R (multiples of the initial risk).
+Results are measured in R (multiples of the initial risk). ``net_r`` subtracts the
+round-trip trading cost expressed in R (cost_pct * entry / risk); the R:R filter
+and all statistics use the net figure.
 
 On start-up the engine replays the last REPLAY_BARS closed candles, so the
 current state does not depend on when the app was opened, and those replayed
@@ -53,11 +55,16 @@ class TradePlan:
     status: str = "OPEN"  # OPEN | TP1 | CLOSED
     closed_t: int | None = None
     exit_reason: str | None = None  # SL | BE | TP2 | SIGNAL
-    result_r: float | None = None
+    result_r: float | None = None  # gross, before costs
+    cost_r: float = 0.0  # round-trip cost in R
 
     @property
     def risk(self) -> float:
         return abs(self.entry - self.initial_stop)
+
+    @property
+    def net_r(self) -> float | None:
+        return None if self.result_r is None else round(self.result_r - self.cost_r, 3)
 
 
 @dataclass
@@ -69,17 +76,23 @@ class SignalState:
     history: list[TradePlan] = field(default_factory=list)  # closed trades in the replay window
     last_t: int | None = None  # last processed closed candle
     gated: bool = False
+    disabled: str | None = None  # why this feed/timeframe issues no signals at all
 
-    def stats(self) -> tuple[int, float, float]:
-        """(trades, win rate, average R) over closed trades."""
-        done = [p for p in self.history if p.result_r is not None]
+    def results(self) -> list[float]:
+        """Net R of closed trades in the replay window, oldest first."""
+        return [p.net_r for p in self.history if p.net_r is not None]
+
+    def stats(self) -> tuple[int, int, float]:
+        """(trades, wins, average net R) over closed trades."""
+        done = self.results()
         if not done:
-            return 0, 0.0, 0.0
-        wins = sum(1 for p in done if p.result_r > 0)
-        return len(done), wins / len(done), sum(p.result_r for p in done) / len(done)
+            return 0, 0, 0.0
+        return len(done), sum(1 for r in done if r > 0), sum(done) / len(done)
 
 
-def build_plan(window: list[Candle], ev: Evaluation, direction: int) -> tuple[TradePlan | None, str | None]:
+def build_plan(
+    window: list[Candle], ev: Evaluation, direction: int, cost_pct: float = 0.0
+) -> tuple[TradePlan | None, str | None]:
     """Structure-based plan for a signal on the last candle of ``window``."""
     entry = window[-1].c
     atr = ev.atr
@@ -104,16 +117,19 @@ def build_plan(window: list[Candle], ev: Evaluation, direction: int) -> tuple[Tr
     if risk > MAX_RISK_ATR * atr:
         return None, f"Stop struktur terlalu jauh ({risk / atr:.1f}× ATR)"
 
+    cost_r = cost_pct * entry / risk
     tp1 = levels[0] if levels else entry + direction * 2 * risk
     rr1 = abs(tp1 - entry) / risk
-    if rr1 < MIN_RR:
+    if rr1 - cost_r < MIN_RR:
         name = "support" if direction < 0 else "resistance"
-        return None, f"R:R TP1 cuma {rr1:.1f} (< {MIN_RR}): {name} {tp1:,.2f} terlalu dekat"
+        return None, f"R:R TP1 setelah biaya cuma {rr1 - cost_r:.1f} (< {MIN_RR}): {name} {tp1:,.2f} terlalu dekat"
 
     beyond = [lv for lv in levels[1:] if abs(lv - entry) >= abs(tp1 - entry) + risk]
     tp2 = beyond[0] if beyond else entry + direction * max(3 * risk, abs(tp1 - entry) + risk)
     rr2 = abs(tp2 - entry) / risk
-    plan = TradePlan(direction, window[-1].t, entry, stop, stop, tp1, tp2, round(rr1, 2), round(rr2, 2))
+    plan = TradePlan(
+        direction, window[-1].t, entry, stop, stop, tp1, tp2, round(rr1, 2), round(rr2, 2), cost_r=round(cost_r, 3)
+    )
     return plan, None
 
 
@@ -139,9 +155,18 @@ def close_on_signal(plan: TradePlan, bar: Candle) -> TradePlan:
 
 
 class SignalEngine:
-    def __init__(self, tf: Timeframe, journal: Path | None = None, symbol: str = ""):
+    def __init__(
+        self,
+        tf: Timeframe,
+        journal: Path | None = None,
+        symbol: str = "",
+        cost_pct: float = 0.0,
+        disabled: str | None = None,
+    ):
         self.tf = tf
-        self.state = SignalState()
+        self.cost_pct = cost_pct
+        self.disabled = disabled
+        self.state = SignalState(disabled=disabled)
         self.last_eval: Evaluation | None = None
         self._journal = journal
         self._symbol = symbol
@@ -165,9 +190,9 @@ class SignalEngine:
                 self._record(st.plan)
                 st.plan = None
 
-        if st.plan is None and not ev.sideways and abs(ev.score) >= ENTER:
+        if st.plan is None and not self.disabled and not ev.sideways and abs(ev.score) >= ENTER:
             direction = 1 if ev.score > 0 else -1
-            plan, reason = build_plan(window, ev, direction)
+            plan, reason = build_plan(window, ev, direction, self.cost_pct)
             if plan:
                 st.plan = plan
                 st.rejection = None
@@ -186,7 +211,7 @@ class SignalEngine:
         times = [c.t for c in closed]
         st = self.state
         if st.last_t is not None and st.last_t not in set(times):
-            self.state = st = SignalState()  # history gap: replay from scratch
+            self.state = st = SignalState(disabled=self.disabled)  # history gap: replay from scratch
         if st.last_t is None:
             start = max(MIN_CANDLES - 1, len(closed) - REPLAY_BARS)
         else:
@@ -207,7 +232,9 @@ class SignalEngine:
         key = (self._symbol, self.tf.key, plan.opened_t)
         if any((r.get("symbol"), r.get("tf"), r.get("opened_t")) == key for r in rows):
             return
-        rows.append({"symbol": self._symbol, "tf": self.tf.key, "recorded_at": int(time.time()), **asdict(plan)})
+        rows.append(
+            {"symbol": self._symbol, "tf": self.tf.key, "recorded_at": int(time.time()), **asdict(plan), "net_r": plan.net_r}
+        )
         try:
             self._journal.parent.mkdir(parents=True, exist_ok=True)
             self._journal.write_text(json.dumps(rows[-2000:], separators=(",", ":")), "utf-8")
@@ -215,20 +242,28 @@ class SignalEngine:
             pass
 
 
-def journal_stats(path: Path, symbol: str, tf_key: str) -> tuple[int, float, float]:
+def journal_stats(path: Path, symbol: str, tf_key: str) -> tuple[int, int, float]:
+    """(trades, wins, average net R) from the on-disk journal."""
     try:
         rows = [r for r in json.loads(path.read_text("utf-8")) if r["symbol"] == symbol and r["tf"] == tf_key]
     except Exception:
-        return 0, 0.0, 0.0
-    if not rows:
-        return 0, 0.0, 0.0
-    wins = sum(1 for r in rows if r["result_r"] > 0)
-    return len(rows), wins / len(rows), sum(r["result_r"] for r in rows) / len(rows)
+        return 0, 0, 0.0
+    net = [r.get("net_r", r["result_r"] - r.get("cost_r", 0.0)) for r in rows]
+    if not net:
+        return 0, 0, 0.0
+    return len(net), sum(1 for r in net if r > 0), sum(net) / len(net)
 
 
 def engine_for(state: MarketState) -> SignalEngine:
     engine = getattr(state, "engine", None)
     if engine is None:
-        engine = SignalEngine(state.tf, state.cache_dir / "journal.json", state.feed.symbol)
+        feed = state.feed
+        disabled = None
+        if state.tf.seconds < feed.min_signal_seconds:
+            disabled = (
+                "Sinyal dimatikan di timeframe ini: riwayat data intraday terlalu pendek untuk diuji "
+                "(Yahoo hanya ±60 hari). Pakai 1 jam ke atas."
+            )
+        engine = SignalEngine(state.tf, state.cache_dir / "journal.json", feed.symbol, feed.cost_pct, disabled)
         state.engine = engine
     return engine

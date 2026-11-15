@@ -7,6 +7,7 @@ import time
 import flet as ft
 
 from analysis import ENTER, EXIT, Snapshot
+from metrics import bootstrap_mean_interval, win_rate_interval
 from datetime import datetime
 from data import DEFAULT_TIMEFRAME, TIMEFRAMES
 from views.chart import EMA20_COLOR, EMA50_COLOR, PriceChart
@@ -105,10 +106,41 @@ def badge(text: str, color: str) -> ft.Container:
     )
 
 
+MIN_TRACK_TRADES = 30
+
+
+def track_record_text(sig, cost_note: str) -> str:
+    """Rolling record without overstating a small sample.
+
+    Below MIN_TRACK_TRADES the win rate and average are hidden; only the count and
+    the exact 95% range of the win rate are shown, so 5/6 reads as "36-100%".
+    """
+    results = sig.results()
+    n = len(results)
+    note = f"Hasil dalam R bersih ({cost_note})." if cost_note else ""
+    if sig.disabled:
+        return note
+    if n == 0:
+        return f"Belum ada sinyal selesai di ±200 candle terakhir. {note}"
+    wins = sum(1 for r in results if r > 0)
+    lo, hi = win_rate_interval(wins, n)
+    if n < MIN_TRACK_TRADES:
+        return (
+            f"Rekam jejak: {n} sinyal di ±200 candle terakhir, terlalu sedikit untuk dinilai "
+            f"(butuh ≥ {MIN_TRACK_TRADES}). Rentang win rate 95%: {lo:.0%}–{hi:.0%}. {note}"
+        )
+    avg = sum(results) / n
+    a, b = bootstrap_mean_interval(results, resamples=2000)
+    return (
+        f"Rekam jejak {n} sinyal: menang {wins / n:.0%} (95%: {lo:.0%}–{hi:.0%}), "
+        f"rata-rata {avg:+.2f}R (95%: {a:+.2f} s/d {b:+.2f}R). {note}"
+    )
+
+
 class MarketCard(ft.Container):
-    def __init__(self, short: str, label: str, source: str, on_timeframe=None):
+    def __init__(self, short: str, label: str, source: str, on_timeframe=None, timeframe: str = DEFAULT_TIMEFRAME):
         self.snapshot: Snapshot | None = None
-        self.timeframe = DEFAULT_TIMEFRAME
+        self.timeframe = timeframe
         self._on_timeframe = on_timeframe
         self.error: str | None = None
         self._label = label
@@ -381,6 +413,9 @@ class MarketCard(ft.Container):
             text = f"{word} dari close candle {tf} {hhmm(sig.plan.opened_t)}. Keluar bila |skor| < {EXIT} atau kena stop/target."
             if conf.sideways:
                 text += f" ADX kini {conf.adx:.0f} < 20: tidak ada entry baru, posisi lama dikelola rencananya."
+        elif sig.disabled:
+            icon, icolor = ft.Icons.BLOCK, MUTED
+            text = sig.disabled
         elif conf.sideways:
             icon, icolor = ft.Icons.BLOCK, MUTED
             text = f"ADX {conf.adx:.0f} < 20: pasar sideways, sinyal tren dimatikan."
@@ -399,13 +434,7 @@ class MarketCard(ft.Container):
             f"Pratinjau candle berjalan (belum final): skor {live.score:+d}"
             + (" · ADX < 20" if live.sideways else "")
         )
-        n, win, avg_r = sig.stats()
-        self._track.value = (
-            f"Rekam jejak {n} sinyal di ±200 candle terakhir: menang {win:.0%}, rata-rata {avg_r:+.2f}R. "
-            "Uji historis BTC (5.000 candle) belum menunjukkan keunggulan dibanding entry acak."
-            if n
-            else "Belum ada sinyal selesai di ±200 candle terakhir. Uji historis BTC belum menunjukkan keunggulan dibanding entry acak."
-        )
+        self._track.value = track_record_text(sig, snap.feed.cost_note)
 
         self._rsi.value = f"{conf.rsi:.1f}"
         self._rsi.color = RED if conf.rsi > 70 else GREEN if conf.rsi < 30 else TEXT
@@ -418,15 +447,17 @@ class MarketCard(ft.Container):
         if plan is not None:
             self._levels.visible = True
             word = "BUY" if plan.direction > 0 else "SELL"
-            self._plan_title.value = f"Rencana {word} · risiko {fmt_price(plan.risk)} per unit (1R)"
+            self._plan_title.value = (
+                f"Rencana {word} · 1R = {fmt_price(plan.risk)} per unit · biaya ≈ {plan.cost_r:.2f}R"
+            )
             self._entry.value = fmt_price(plan.entry)
             self._stop.value = fmt_price(plan.stop) + (" (BE)" if plan.status == "TP1" else "")
-            self._tp1.value = f"{fmt_price(plan.tp1)} · {plan.rr1:.1f}R"
-            self._tp2.value = f"{fmt_price(plan.tp2)} · {plan.rr2:.1f}R"
-            open_r = (snap.price - plan.entry) * plan.direction / plan.risk
+            self._tp1.value = f"{fmt_price(plan.tp1)} · {plan.rr1 - plan.cost_r:.1f}R bersih"
+            self._tp2.value = f"{fmt_price(plan.tp2)} · {plan.rr2 - plan.cost_r:.1f}R bersih"
+            open_r = (snap.price - plan.entry) * plan.direction / plan.risk - plan.cost_r
             status = "TP1 tercapai, setengah posisi diamankan, stop pindah ke entry" if plan.status == "TP1" else "Berjalan"
             self._plan_status.value = (
-                f"{status} · posisi sekarang {open_r:+.2f}R. Stop di balik swing terakhir + 0,25 ATR, "
+                f"{status} · posisi sekarang {open_r:+.2f}R setelah biaya. Stop di balik swing terakhir + 0,25 ATR, "
                 "level tidak berubah sampai sinyal selesai."
             )
         else:

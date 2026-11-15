@@ -177,9 +177,18 @@ def evaluate(candles: list[Candle], tf: Timeframe | None = None) -> Evaluation:
     last = candles[-1]
     avg_vol = fmean(c.v for c in candles[-21:-1])
     if avg_vol > 0 and last.v >= 1.3 * avg_vol and last.c != last.o:
+        # Points follow the candle colour (+ bullish, - bearish), like every other
+        # factor's sign. The old code gave a high-volume green candle -10 while the
+        # score leaned bearish, i.e. it read buying pressure as bearish.
         bar = _sign(last.c - last.o)
-        pts = 10 if bar == direction else -10
-        f.append(Factor("Volume", f"Volume {last.v / avg_vol:.1f}× rata-rata, candle {'hijau' if bar > 0 else 'merah'}", pts * abs(direction)))
+        word = "searah skor" if bar == direction else "melawan arah skor"
+        f.append(
+            Factor(
+                "Volume",
+                f"Volume {last.v / avg_vol:.1f}× rata-rata, candle {'hijau (tekanan beli)' if bar > 0 else 'merah (tekanan jual)'}, {word}",
+                10 * bar * abs(direction),
+            )
+        )
     else:
         f.append(Factor("Volume", "Volume normal, tidak ada konfirmasi", 0))
 

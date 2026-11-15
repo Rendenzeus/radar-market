@@ -24,7 +24,7 @@ class MarketDashboard(ft.Column):
         self._feeds = {feed.symbol: feed for feed in FEEDS}
         self._states: dict[tuple[str, str], MarketState] = {}
         self._cards = {
-            feed.symbol: MarketCard(feed.short, feed.label, feed.source, on_timeframe=self._on_timeframe)
+            feed.symbol: MarketCard(feed.short, feed.label, feed.source, on_timeframe=self._on_timeframe, timeframe=feed.default_timeframe)
             for feed in FEEDS
         }
         self._busy: set[tuple[str, str]] = set()
@@ -43,7 +43,7 @@ class MarketDashboard(ft.Column):
                 ft.Column(
                     [
                         ft.Text("Market Radar", size=22, weight=ft.FontWeight.BOLD, color=TEXT),
-                        ft.Text("Sinyal teknikal XAU & BTC · pilih timeframe 1m–1D di tiap kartu", size=12, color=MUTED),
+                        ft.Text("Sinyal teknikal Gold futures & BTC · pilih timeframe 1m–1D di tiap kartu", size=12, color=MUTED),
                     ],
                     spacing=2,
                     expand=True,
@@ -58,7 +58,8 @@ class MarketDashboard(ft.Column):
                 "(GC=F) dari Yahoo yang bisa tertunda ±10 menit; BTC real-time dari Binance. "
                 "Sinyal hanya dari candle close (masuk ±35, keluar ±20, mati saat ADX < 20); "
                 "stop di balik swing terakhir, sinyal ditolak bila R:R TP1 < 1,5. "
-                "Uji historis BTC belum menunjukkan keunggulan, jadi sinyal masih eksperimental.",
+                "Uji 2 tahun dengan biaya (BTC 15m, Gold 1h): rugi atau impas setelah biaya, tidak lulus syarat. "
+                "Sinyal eksperimental, jangan dipakai untuk uang sungguhan. Detail: docs/backtest.md.",
                 size=11,
                 color=MUTED,
             ),

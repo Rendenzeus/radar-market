@@ -134,6 +134,13 @@ class Feed:
     source: str
     always_open: bool = False
     refresh_seconds: float = 15
+    # Round-trip trading cost as a fraction of price (fees + slippage, both sides).
+    cost_pct: float = 0.0
+    cost_note: str = ""
+    # Shortest timeframe with enough history to test the signal; below it the
+    # app shows the chart but issues no trade signals.
+    min_signal_seconds: int = 0
+    default_timeframe: str = DEFAULT_TIMEFRAME
 
     def fetch(self, tf: Timeframe, full: bool) -> tuple[list[Candle], Quote]:
         raise NotImplementedError
@@ -158,6 +165,9 @@ class BinanceFeed(Feed):
         self.short = short
         self.source = "Binance spot · real-time"
         self.always_open = True
+        # Binance spot Regular User: 0.10% maker/taker per side + ~0.03% slippage per side.
+        self.cost_pct = 2 * (0.0010 + 0.0003)
+        self.cost_note = "biaya 0,1%/sisi + slippage 0,03%/sisi"
         self.refresh_seconds = 3
         self._host = self.HOSTS[0]
 
@@ -235,6 +245,12 @@ class YahooFeed(Feed):
         self.short = short
         self.source = source
         self.refresh_seconds = 15
+        # Rough futures/CFD cost (spread + commission + slippage); an assumption.
+        self.cost_pct = 0.0003
+        self.cost_note = "asumsi biaya+slippage 0,03% pulang-pergi"
+        # Yahoo keeps only ~60 days of 15m/30m bars but ~730 days of 1h bars.
+        self.min_signal_seconds = 3600
+        self.default_timeframe = "1h"
 
     def recent_window(self, tf: Timeframe) -> float:
         return {"1d": 20 * 86400, "1h": 3 * 86400, "4h": 3 * 86400}.get(tf.key, 12 * 3600)
