@@ -22,7 +22,7 @@ from data import TIMEFRAMES, BinanceFeed, YahooFeed  # noqa: E402
 from indicators import atr_series  # noqa: E402
 from metrics import bootstrap_mean_interval, longest_losing_streak, max_drawdown, win_rate_interval  # noqa: E402
 from signals import ENTRY_N, EXIT_N, STOP_ATR, TREND_EMA, run_strategy  # noqa: E402
-from tools.backtest_walkforward import CACHE, binance_history  # noqa: E402
+from tools.history import CACHE, binance_history  # noqa: E402
 
 HOLDOUT_START = calendar.timegm((2023, 1, 1, 0, 0, 0))
 GOLD_SPLIT = calendar.timegm((2016, 1, 1, 0, 0, 0))
@@ -35,7 +35,8 @@ GOLD_COST = YahooFeed("GC=F", "", "", "").cost_pct
 
 def gold_daily():
     feed = YahooFeed("GC=F", "GC=F", "GC", "")
-    feed.PARAMS = dict(feed.PARAMS, **{"1d": ("1d", "max", "1mo")})
+    # "max" comes back as monthly bars; 20y is the longest range that stays daily
+    feed.PARAMS = dict(feed.PARAMS, **{"1d": ("1d", "20y", "1mo")})
     candles, _ = feed.fetch(TIMEFRAMES["1d"], full=True)
     return [c for c in candles if c.t + 86400 <= time.time()]
 
@@ -151,7 +152,7 @@ def split(candles, trades, start, end=None):
 def main():
     out = {"spec": "docs/signal-v2.md", "run_at": int(time.time())}
     for tf_key in ("4h", "1d"):
-        hold_all, hold_long, groups, groups_long = [], [], [], []
+        hold_all, hold_long, groups = [], [], []
         for sym in SYMBOLS:
             candles = binance_history(sym, tf_key, DAYS)
             trades, _ = run_strategy(candles, CRYPTO_COST)

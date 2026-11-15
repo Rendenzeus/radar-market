@@ -56,10 +56,11 @@ class MarketDashboard(ft.Column):
             ft.Text(
                 "Analisis teknikal edukatif, bukan rekomendasi finansial. Gold memakai harga futures COMEX "
                 "(GC=F) dari Yahoo yang bisa tertunda ±10 menit; BTC real-time dari Binance. "
-                "Sinyal hanya dari candle close (masuk ±35, keluar ±20, mati saat ADX < 20); "
-                "stop di balik swing terakhir, sinyal ditolak bila R:R TP1 < 1,5. "
-                "Uji 2 tahun dengan biaya (BTC 15m, Gold 1h): rugi atau impas setelah biaya, tidak lulus syarat. "
-                "Sinyal eksperimental, jangan dipakai untuk uang sungguhan. Detail: docs/backtest.md.",
+                "Sinyal v2: breakout 20 candle searah EMA200, stop 2× ATR terkunci, keluar trailing 10 candle, "
+                "hanya di 4 jam/1 hari (Gold 1 hari), dari candle close. Skor 0–100 hanya konteks. "
+                "Uji holdout 2023–2026 (5 kripto, 4 jam, setelah biaya): +0,24R per trade dan lulus syarat yang ditetapkan "
+                "sebelum uji, tapi buktinya tipis: koin saling berkorelasi, hasil 2025–2026 lebih lemah, posisi SELL rugi. "
+                "Tahap berikutnya paper trading, bukan uang sungguhan. Detail: docs/backtest.md.",
                 size=11,
                 color=MUTED,
             ),
@@ -196,7 +197,7 @@ class MarketDashboard(ft.Column):
             ft.SnackBar(
                 ft.Text(
                     f"{snap.feed.label} {snap.tf.key}: {word} (eksperimental) entry {plan.entry:,.2f} · "
-                    f"stop {plan.stop:,.2f} · TP1 {plan.tp1:,.2f} ({plan.rr1:.1f}R)",
+                    f"stop {plan.stop:,.2f} · keluar trailing {plan.trail:,.2f}",
                     color=BG,
                 ),
                 bgcolor=signal_color(word),

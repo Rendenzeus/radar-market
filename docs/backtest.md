@@ -3,7 +3,72 @@
 Hasil dalam R (kelipatan risiko awal). "Bersih" berarti sudah dipotong biaya transaksi.
 Rentang ± dan "95%" adalah interval keyakinan 95%.
 
-## Uji 2 periode dengan biaya (`tools/backtest_walkforward.py`), 15 Nov 2026
+## Sinyal v2: breakout 4h/1D (`tools/backtest_trend.py`), 15 Nov 2026
+
+Aturan, data, dan syarat lulus ditulis di [signal-v2.md](signal-v2.md) dan di-commit
+(54b42f0) sebelum uji dijalankan. Tidak ada parameter yang diubah setelah hasil terlihat.
+Satu perbaikan setelah uji pertama: data Gold diambil ulang karena Yahoo `range=max`
+ternyata mengembalikan candle bulanan, bukan harian. Itu perbaikan data, bukan aturan.
+
+### Holdout utama: BTC, ETH, BNB, SOL, XRP di 4h, trade dibuka 2023 – Nov 2026
+
+| | Hasil |
+|---|---|
+| Trade | 932 |
+| Menang | 30% (27–33%) |
+| Expectancy kotor | +0,32R |
+| Biaya rata-rata | 0,09R |
+| **Expectancy bersih** | **+0,24R** (bootstrap 95%: +0,05 s/d +0,44) |
+| Max drawdown | 49R |
+| Rentetan kalah terpanjang | 21 |
+| Entry acak (1.000 simulasi) | rata-rata +0,00R; sinyal mengalahkan 99,6% |
+
+Syarat: ≥ 150 trade LULUS · expectancy bersih ≥ +0,15R LULUS · batas bawah bootstrap > 0
+LULUS · mengalahkan ≥ 95% acak LULUS.
+
+### Kenapa ini belum cukup untuk uang sungguhan
+
+- **Koin saling berkorelasi.** Bootstrap di atas menganggap tiap trade independen, padahal
+  breakout BTC, ETH, dan lainnya sering terjadi bersamaan. Kalau di-bootstrap per bulan
+  (cek tambahan, bukan syarat yang didaftarkan), rentang 95%-nya −0,06 s/d +0,59R:
+  batas bawahnya di bawah nol.
+- **Melemah dari tahun ke tahun.** Per tahun: 2023 +0,45R, 2024 +0,31R, 2025 +0,09R,
+  2026 +0,13R. Dua tahun terakhir di bawah ambang +0,15R.
+- **Per koin tidak ada yang signifikan sendiri.** BTC +0,41R, ETH +0,39R, BNB +0,06R,
+  SOL +0,20R, XRP +0,16R; semua rentang 95%-nya mencakup nol.
+- **Posisi SELL rugi.** 444 trade short: −0,09R per trade. Long saja: +0,54R per trade
+  (497 trade, rentang +0,21 s/d +0,90). Di spot memang hanya long yang bisa dijalankan.
+  Ini cek tambahan; aturan tidak diubah jadi long saja karena keputusan itu diambil setelah
+  melihat hasil. Kalau mau, uji sebagai v3 di data yang belum dipakai.
+- **Win rate rendah.** 70% trade kalah, rentetan kalah bisa 20 kali lebih. Hasil datang dari
+  sedikit trade yang untung besar.
+- Data BTC 2024–2026 sudah pernah dilihat waktu uji v1 (dengan aturan berbeda).
+
+### Cek tambahan
+
+| Uji | Trade | Bersih per trade (95%) | Mengalahkan acak |
+|---|---|---|---|
+| BTC 4h, sebelum 2023 (pengembangan) | 226 | +0,59R (+0,19 s/d +1,05) | 98,5% |
+| 5 kripto 1D, 2023+ | 160 | +0,43R (−0,12 s/d +1,15) | 90,0% |
+| 5 kripto 1D, 2023+, long saja | 87 | +1,02R (+0,05 s/d +2,34) | – |
+| Gold 1D, 2006–2015 | 56 | +0,32R (−0,15 s/d +0,86) | 88,6% |
+| Gold 1D, 2016+ | 69 | +0,20R (−0,25 s/d +0,73) | 84,7% |
+
+Arahnya konsisten positif, tapi di 1D dan Gold jumlah trade terlalu sedikit untuk yakin.
+
+### Langkah berikutnya
+
+Paper trading 6–8 minggu. App menulis tiap entry dan exit yang terjadi setelah app dibuka
+ke `journal.jsonl` (append-only, satu baris per kejadian, ada waktu pencatatan, tidak
+pernah ditulis ulang). Hasilnya harus masuk rentang backtest sebelum uang kecil dipakai.
+
+Mengulang: `python tools/backtest_trend.py` (unduh ±20.000 candle per koin, ±10 menit).
+
+---
+
+# Arsip: sinyal v1 (skor gabungan), sudah diganti
+
+## Uji 2 periode dengan biaya (alat lama, sudah dihapus), 15 Nov 2026
 
 Aturan sama persis dengan app (hanya candle close, masuk |skor| ≥ 35 dan ADX ≥ 20,
 keluar |skor| < 20, stop di balik swing terakhir + 0,25 ATR, sinyal ditolak bila R:R TP1
@@ -74,18 +139,7 @@ mengikuti warna candle: hijau +10, merah −10, dengan keterangan searah/melawan
 
 ## Uji lama (sebelum biaya, 5.000 candle)
 
-`tools/backtest_signal.py` dan `tools/backtest_reversal.py` masih ada untuk perbandingan.
 Hasilnya (tanpa biaya, sebelum perbaikan volume) juga tidak menunjukkan keunggulan.
-
-## Mengulang
-
-```bash
-python tools/backtest_walkforward.py BTCUSDT 15m 730
-python tools/backtest_walkforward.py GC=F 1h
-```
-
-Data Binance disimpan di `tools/.history/` (tidak masuk git) dan hasil JSON-nya juga.
-
-App mencatat tiap sinyal yang selesai ke `journal.json` di folder data app (entry, stop,
-target, hasil kotor dan bersih dalam R). Log ini bisa dipakai untuk paper trading, tapi
-belum append-only yang terkunci: file bisa diedit manual.
+Alat uji v1 (`backtest_signal.py`, `backtest_walkforward.py`) sudah dihapus; versi
+terakhirnya ada di commit 851d31b. `tools/backtest_reversal.py` masih ada untuk detektor
+balik arah.

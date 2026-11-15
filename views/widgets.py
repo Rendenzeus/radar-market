@@ -6,7 +6,8 @@ import time
 
 import flet as ft
 
-from analysis import ENTER, EXIT, Snapshot
+from analysis import Snapshot
+from signals import ENTRY_N, EXIT_N, STOP_ATR
 from metrics import bootstrap_mean_interval, win_rate_interval
 from datetime import datetime
 from data import DEFAULT_TIMEFRAME, TIMEFRAMES
@@ -121,18 +122,18 @@ def track_record_text(sig, cost_note: str) -> str:
     if sig.disabled:
         return note
     if n == 0:
-        return f"Belum ada sinyal selesai di ±200 candle terakhir. {note}"
+        return f"Belum ada sinyal selesai di {sig.bars} candle yang dimuat. {note}"
     wins = sum(1 for r in results if r > 0)
     lo, hi = win_rate_interval(wins, n)
     if n < MIN_TRACK_TRADES:
         return (
-            f"Rekam jejak: {n} sinyal di ±200 candle terakhir, terlalu sedikit untuk dinilai "
+            f"Rekam jejak: {n} sinyal di {sig.bars} candle yang dimuat, terlalu sedikit untuk dinilai "
             f"(butuh ≥ {MIN_TRACK_TRADES}). Rentang win rate 95%: {lo:.0%}–{hi:.0%}. {note}"
         )
     avg = sum(results) / n
     a, b = bootstrap_mean_interval(results, resamples=2000)
     return (
-        f"Rekam jejak {n} sinyal: menang {wins / n:.0%} (95%: {lo:.0%}–{hi:.0%}), "
+        f"Rekam jejak {n} sinyal di {sig.bars} candle: menang {wins / n:.0%} (95%: {lo:.0%}–{hi:.0%}), "
         f"rata-rata {avg:+.2f}R (95%: {a:+.2f} s/d {b:+.2f}R). {note}"
     )
 
@@ -284,9 +285,9 @@ class MarketCard(ft.Container):
             return ft.Column([ft.Text(caption, size=11, color=MUTED), value], spacing=2, expand=1), value
 
         entry_col, self._entry = cell("Entry (terkunci)", TEXT)
-        stop_col, self._stop = cell("Stop loss", RED)
-        tp1_col, self._tp1 = cell("Target 1", GREEN)
-        tp2_col, self._tp2 = cell("Target 2", GREEN)
+        stop_col, self._stop = cell(f"Stop {STOP_ATR:.0f}× ATR (terkunci)", RED)
+        tp1_col, self._tp1 = cell(f"Keluar trailing ({EXIT_N} candle)", AMBER)
+        tp2_col, self._tp2 = cell("Posisi sekarang", TEXT)
         self._plan_title = ft.Text("", size=12, weight=ft.FontWeight.W_600, color=TEXT)
         self._plan_status = ft.Text("", size=11, color=MUTED)
         self._levels = ft.Container(
@@ -386,7 +387,9 @@ class MarketCard(ft.Container):
         markers = []
         if sig.plan is not None:
             pl = sig.plan
-            markers = [(pl.entry, TEXT, "Entry"), (pl.stop, RED, "Stop"), (pl.tp1, GREEN, "TP1"), (pl.tp2, GREEN, "TP2")]
+            markers = [(pl.entry, TEXT, "Entry"), (pl.stop, RED, "Stop")]
+            if pl.trail is not None:
+                markers.append((pl.trail, AMBER, "Trailing"))
         elif rev.stage != "NONE" and rev.trigger is not None:
             markers = [(rev.trigger, BLUE, "Pemicu"), (rev.invalidation, MUTED, "Batal")]
         self._chart.set_markers(markers)
@@ -400,7 +403,7 @@ class MarketCard(ft.Container):
         tf = tf_label(snap.tf.key)
         self._signal.value = sig.label
         self._signal.color = MUTED if closed else color
-        self._score.value = f"skor {conf.score:+d}/100 (candle close)"
+        self._score.value = f"skor konteks {conf.score:+d}/100"
         self._bar.set_score(conf.score)
         self._signal_box.border = ft.Border.all(1, ft.Colors.with_opacity(0.45, color) if sig.plan and not closed else BORDER)
 
@@ -410,29 +413,27 @@ class MarketCard(ft.Container):
         if sig.plan is not None:
             word = "BUY" if sig.plan.direction > 0 else "SELL"
             icon, icolor = ft.Icons.CHECK_CIRCLE, color
-            text = f"{word} dari close candle {tf} {hhmm(sig.plan.opened_t)}. Keluar bila |skor| < {EXIT} atau kena stop/target."
-            if conf.sideways:
-                text += f" ADX kini {conf.adx:.0f} < 20: tidak ada entry baru, posisi lama dikelola rencananya."
+            edge = "tertinggi" if sig.plan.direction > 0 else "terendah"
+            text = (
+                f"{word}: close candle {tf} {hhmm(sig.plan.opened_t)} menembus {edge} {ENTRY_N} candle, searah EMA200. "
+                f"Tanpa target: keluar bila kena stop atau close menembus level trailing."
+            )
         elif sig.disabled:
             icon, icolor = ft.Icons.BLOCK, MUTED
             text = sig.disabled
-        elif conf.sideways:
-            icon, icolor = ft.Icons.BLOCK, MUTED
-            text = f"ADX {conf.adx:.0f} < 20: pasar sideways, sinyal tren dimatikan."
-        elif sig.rejection and sig.rejection_t == conf.t:
-            icon, icolor = ft.Icons.DO_NOT_DISTURB_ON, AMBER
-            text = sig.rejection
         else:
             icon, icolor = ft.Icons.SCHEDULE, MUTED
-            text = f"Menunggu: sinyal muncul bila skor candle close ≥ +{ENTER} atau ≤ −{ENTER} dan R:R ≥ 1,5."
+            text = (
+                f"Menunggu breakout: BUY bila close candle {tf} di atas high {ENTRY_N} candle dan di atas EMA200, "
+                f"SELL bila di bawah low {ENTRY_N} candle dan di bawah EMA200."
+            )
         if closed:
             icon, icolor = ft.Icons.NIGHTLIGHT_ROUND, MUTED
             text = "Pasar tutup. " + text
         self._confirm_icon.icon, self._confirm_icon.color = icon, icolor
         self._confirm.value = text
         self._preview.value = (
-            f"Pratinjau candle berjalan (belum final): skor {live.score:+d}"
-            + (" · ADX < 20" if live.sideways else "")
+            f"Skor konteks hanya info, tidak memicu sinyal. Candle berjalan: {live.score:+d}"
         )
         self._track.value = track_record_text(sig, snap.feed.cost_note)
 
@@ -451,14 +452,16 @@ class MarketCard(ft.Container):
                 f"Rencana {word} · 1R = {fmt_price(plan.risk)} per unit · biaya ≈ {plan.cost_r:.2f}R"
             )
             self._entry.value = fmt_price(plan.entry)
-            self._stop.value = fmt_price(plan.stop) + (" (BE)" if plan.status == "TP1" else "")
-            self._tp1.value = f"{fmt_price(plan.tp1)} · {plan.rr1 - plan.cost_r:.1f}R bersih"
-            self._tp2.value = f"{fmt_price(plan.tp2)} · {plan.rr2 - plan.cost_r:.1f}R bersih"
-            open_r = (snap.price - plan.entry) * plan.direction / plan.risk - plan.cost_r
-            status = "TP1 tercapai, setengah posisi diamankan, stop pindah ke entry" if plan.status == "TP1" else "Berjalan"
+            self._stop.value = fmt_price(plan.stop)
+            self._tp1.value = fmt_price(plan.trail) if plan.trail is not None else "-"
+            open_r = plan.open_r(snap.price)
+            self._tp2.value = f"{open_r:+.2f}R bersih"
+            self._tp2.color = GREEN if open_r > 0 else RED
+            side = "di bawah" if plan.direction > 0 else "di atas"
             self._plan_status.value = (
-                f"{status} · posisi sekarang {open_r:+.2f}R setelah biaya. Stop di balik swing terakhir + 0,25 ATR, "
-                "level tidak berubah sampai sinyal selesai."
+                f"Stop terkunci. Level trailing = {'low terendah' if plan.direction > 0 else 'high tertinggi'} "
+                f"{EXIT_N} candle terakhir, dihitung ulang hanya saat candle close dan hanya bergerak searah posisi. "
+                f"Keluar bila candle close {side} level itu."
             )
         else:
             self._levels.visible = False
