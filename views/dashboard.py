@@ -1,105 +1,156 @@
-"""Flet dashboard for automatic XAU and BTC signal monitoring."""
+"""Market Radar dashboard: one independent refresh loop per market."""
+
+from __future__ import annotations
 
 import asyncio
+import time
+from datetime import datetime
 
 import flet as ft
 
-from models import MARKETS, MarketSignal, analyze_market
+from analysis import build_snapshot
+from data import FEEDS, MarketState, default_cache_dir
+from views.widgets import BG, BORDER, MUTED, TEXT, MarketCard, signal_color
+
+CACHE_SAVE_SECONDS = 5 * 60
+CLOSED_MARKET_REFRESH = 5 * 60
 
 
 class MarketDashboard(ft.Column):
     def __init__(self):
-        self._loading = False
-        self._last_notified: dict[str, str] = {}
-        self._status = ft.Text("Menunggu pembaruan market...")
-        self._refresh_button = ft.Button(
-            content="Perbarui sekarang",
-            on_click=self._refresh,
-        )
-        self._market_controls: dict[str, dict[str, ft.Text]] = {}
+        cache_dir = default_cache_dir()
+        self._states = [MarketState(feed, cache_dir) for feed in FEEDS]
+        self._cards = {s.feed.symbol: MarketCard(s.feed.short, s.feed.label, s.feed.source) for s in self._states}
+        self._busy: set[str] = set()
+        self._last_alert: dict[str, str] = {}
+        self._last_save = time.time()
+        self._wake: dict[str, asyncio.Event] = {}
 
-        panels = [self._build_market_panel(symbol, label) for symbol, label in MARKETS]
-        super().__init__(
-            controls=[
-                ft.Text("Analisis XAU & BTC", size=20, weight=ft.FontWeight.BOLD),
-                self._status,
-                *panels,
-                self._refresh_button,
-                ft.Text(
-                    "Sinyal adalah analisis teknikal edukatif, bukan rekomendasi finansial."
+        self._clock = ft.Text("", size=12, color=MUTED)
+        self._refresh_btn = ft.IconButton(ft.Icons.REFRESH, icon_color=TEXT, tooltip="Perbarui sekarang", on_click=self._refresh_all)
+
+        header = ft.Row(
+            [
+                ft.Column(
+                    [
+                        ft.Text("Market Radar", size=22, weight=ft.FontWeight.BOLD, color=TEXT),
+                        ft.Text("Sinyal teknikal XAU & BTC · timeframe 15m + konfirmasi 1j", size=12, color=MUTED),
+                    ],
+                    spacing=2,
+                    expand=True,
                 ),
-            ],
-            spacing=20,
+                self._clock,
+                self._refresh_btn,
+            ]
+        )
+        disclaimer = ft.Container(
+            ft.Text(
+                "Analisis teknikal edukatif, bukan rekomendasi finansial. Gold memakai harga futures COMEX "
+                "(GC=F) dari Yahoo yang bisa tertunda ±10 menit; BTC real-time dari Binance. "
+                "Stop/target dihitung dari ATR (1,5× dan 3×).",
+                size=11,
+                color=MUTED,
+            ),
+            padding=ft.Padding.only(top=6, bottom=24),
+            border=ft.Border.only(top=ft.BorderSide(1, BORDER)),
+        )
+        super().__init__(
+            controls=[header, ft.ResponsiveRow(list(self._cards.values()), spacing=16, run_spacing=16), disclaimer],
+            spacing=18,
         )
 
-    def _build_market_panel(self, symbol: str, label: str) -> ft.Column:
-        price = ft.Text(f"{label}: Harga -", size=18, weight=ft.FontWeight.BOLD)
-        signal = ft.Text("Sinyal: menunggu...")
-        indicator = ft.Text("Skor: - | RSI: -")
-        details = ft.Text("Indikator: -")
-        self._market_controls[symbol] = {
-            "price": price,
-            "signal": signal,
-            "indicator": indicator,
-            "details": details,
-        }
-        return ft.Column(controls=[price, signal, indicator, details])
-
+    # ----------------------------------------------------------- lifecycle
     def start(self) -> None:
-        self.page.appbar = ft.AppBar(title=ft.Text("Market Radar"))
-        asyncio.create_task(self._refresh_loop())
-
-    async def _refresh_loop(self) -> None:
-        while True:
-            await self._refresh()
-            await asyncio.sleep(30)
-
-    async def _refresh(self, e=None) -> None:
-        if self._loading:
-            return
-
-        self._loading = True
-        self._refresh_button.disabled = True
-        self._status.value = "Menganalisis XAU dan BTC..."
+        # Render cached candles immediately so the app is useful before the network answers.
+        for state in self._states:
+            if state.candles:
+                try:
+                    self._cards[state.feed.symbol].show(build_snapshot(state))
+                except Exception:
+                    pass
         self.page.update()
+        for state in self._states:
+            self._wake[state.feed.symbol] = asyncio.Event()
+            self.page.run_task(self._market_loop, state)
+        self.page.run_task(self._ticker)
 
+    async def _market_loop(self, state: MarketState) -> None:
+        wake = self._wake[state.feed.symbol]
+        while True:
+            await self._refresh_one(state)
+            card = self._cards[state.feed.symbol]
+            delay = state.feed.refresh_seconds
+            if card.snapshot and card.snapshot.status == "CLOSED":
+                delay = CLOSED_MARKET_REFRESH
+            elif card.error:
+                delay = min(30, delay * 3)
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            wake.clear()
+
+    async def _refresh_one(self, state: MarketState) -> None:
+        symbol = state.feed.symbol
+        if symbol in self._busy:
+            return
+        self._busy.add(symbol)
+        card = self._cards[symbol]
         try:
-            results = await asyncio.gather(
-                *(asyncio.to_thread(analyze_market, symbol, label) for symbol, label in MARKETS)
-            )
-            for result in results:
-                self._show_result(result)
-            self._status.value = "Data diperbarui setiap 30 detik."
-        except Exception:
-            self._status.value = "Tidak dapat mengambil data. Periksa koneksi internet lalu coba lagi."
+            await asyncio.to_thread(state.refresh)
+            snap = await asyncio.to_thread(build_snapshot, state)
+            card.show(snap)
+            self._maybe_alert(snap)
+        except Exception as exc:
+            card.show_error(_friendly_error(exc))
         finally:
-            self._loading = False
-            self._refresh_button.disabled = False
-            self.page.update()
+            self._busy.discard(symbol)
+        card.update()
 
-    def _show_result(self, result: MarketSignal) -> None:
-        controls = self._market_controls[result.symbol]
-        controls["price"].value = f"{result.label}: {result.price:,.2f}"
-        controls["signal"].value = f"Sinyal: {result.signal}"
-        controls["signal"].color = self._signal_color(result.signal)
-        controls["indicator"].value = f"Skor konsensus: {result.score:+d}/5 | RSI(14): {result.rsi:.1f}"
-        controls["details"].value = f"Indikator: {result.details}"
+        if time.time() - self._last_save > CACHE_SAVE_SECONDS:
+            self._last_save = time.time()
+            for s in self._states:
+                await asyncio.to_thread(s.save_cache)
 
-        strong_signal = result.signal in {"STRONG BUY", "STRONG SELL"}
-        if strong_signal and self._last_notified.get(result.symbol) != result.signal:
+    async def _ticker(self) -> None:
+        while True:
+            self._clock.value = datetime.now().strftime("%H:%M:%S")
+            self._clock.update()
+            for card in self._cards.values():
+                card.tick()
+                card.update()
+            await asyncio.sleep(1)
+
+    async def _refresh_all(self, e=None) -> None:
+        for state in self._states:
+            state.last_full_sync = 0  # force a clean resync on manual refresh
+            self._wake[state.feed.symbol].set()
+
+    # --------------------------------------------------------------- alerts
+    def _maybe_alert(self, snap) -> None:
+        """Alert only on signals confirmed by a closed candle, so they never repaint."""
+        symbol = snap.feed.symbol
+        signal = snap.confirmed.signal
+        previous = self._last_alert.get(symbol)
+        self._last_alert[symbol] = signal
+        if previous is None or previous == signal or snap.status == "CLOSED":
+            return
+        if signal in {"STRONG BUY", "STRONG SELL"}:
             self.page.show_dialog(
                 ft.SnackBar(
-                    content=ft.Text(
-                        f"{result.label}: {result.signal} pada {result.price:,.2f}"
-                    )
+                    ft.Text(f"{snap.feed.label}: {signal} di {snap.price:,.2f} (skor {snap.confirmed.score:+d})", color=BG),
+                    bgcolor=signal_color(signal),
+                    duration=ft.Duration(seconds=8),
                 )
             )
-        self._last_notified[result.symbol] = result.signal
 
-    @staticmethod
-    def _signal_color(signal: str):
-        if "BUY" in signal:
-            return ft.Colors.GREEN
-        if "SELL" in signal:
-            return ft.Colors.RED
-        return ft.Colors.AMBER
+
+def _friendly_error(exc: Exception) -> str:
+    text = str(exc)
+    if "429" in text:
+        return "Sumber data membatasi permintaan (429)"
+    if "timed out" in text.lower() or "timeout" in text.lower():
+        return "Koneksi timeout"
+    if isinstance(exc, (ConnectionError, OSError)):
+        return "Tidak ada koneksi ke sumber data"
+    return text or exc.__class__.__name__
