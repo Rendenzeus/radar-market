@@ -14,11 +14,12 @@ from bisect import bisect_right
 from dataclasses import dataclass, field
 from statistics import fmean
 
-from data import HTF_SECONDS, TIMEFRAMES, Candle, Feed, MarketState, Timeframe, is_closed, resample
+from data import HTF_SECONDS, TIMEFRAMES, Candle, Feed, MarketState, OrderFlow, Timeframe, is_closed, resample
+from reversal import Reversal, detect as detect_reversal
 from indicators import adx, atr_series, bollinger, ema_series, macd_series, rsi_series
 
 MIN_CANDLES = 260
-CHART_CANDLES = 200
+CHART_CANDLES = 400
 STRONG = 60
 NORMAL = 25
 
@@ -64,6 +65,8 @@ class Snapshot:
     confirmed: Evaluation  # evaluated on closed candles only (does not repaint)
     levels: Levels | None
     latency_ms: int
+    reversal: Reversal
+    flow: OrderFlow | None = None
     fetched_at: float = field(default_factory=time.time)
 
     @property
@@ -185,7 +188,7 @@ def evaluate(candles: list[Candle], tf: Timeframe | None = None) -> Evaluation:
     return Evaluation(score, label_for(score), f, rsi, adx_val, atr, trend_htf, sideways, tf.htf_key)
 
 
-def build_snapshot(state: MarketState) -> Snapshot:
+def build_snapshot(state: MarketState, flow: OrderFlow | None = None, news=None) -> Snapshot:
     candles = state.candles
     if state.quote is None or len(candles) < MIN_CANDLES:
         raise ValueError("Data candle belum cukup untuk analisis.")
@@ -220,7 +223,19 @@ def build_snapshot(state: MarketState) -> Snapshot:
             tp2=price + direction * 3.0 * live.atr,
         )
 
+    reversal = detect_reversal(
+        candles,
+        tf,
+        price,
+        flow=flow,
+        news_score=news.recent if news and news.recent else (news.score if news else 0.0),
+        news_shift=news.shift if news else 0.0,
+        has_news=bool(news and news.headlines),
+    )
+
     return Snapshot(
+        reversal=reversal,
+        flow=flow,
         feed=state.feed,
         price=price,
         quote_time=state.quote.time,

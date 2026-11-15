@@ -9,11 +9,13 @@ from datetime import datetime
 import flet as ft
 
 from analysis import build_snapshot
+from news import fetch_news
 from data import FEEDS, TIMEFRAMES, Feed, MarketState, default_cache_dir
 from views.widgets import BG, BORDER, MUTED, TEXT, MarketCard, signal_color
 
 CACHE_SAVE_SECONDS = 5 * 60
 CLOSED_MARKET_REFRESH = 5 * 60
+NEWS_REFRESH = 5 * 60
 
 
 class MarketDashboard(ft.Column):
@@ -26,6 +28,9 @@ class MarketDashboard(ft.Column):
             for feed in FEEDS
         }
         self._busy: set[tuple[str, str]] = set()
+        self._news: dict[str, object] = {}
+        self._flow: dict[str, object] = {}
+        self._last_reversal: dict[tuple[str, str], str] = {}
         self._last_alert: dict[str, str] = {}
         self._last_save = time.time()
         self._wake: dict[str, asyncio.Event] = {}
@@ -75,7 +80,7 @@ class MarketDashboard(ft.Column):
         state = self._state(symbol)
         if state.candles:
             try:
-                self._cards[symbol].show(build_snapshot(state))
+                self._cards[symbol].show(build_snapshot(state, None, self._news.get(symbol)))
             except Exception:
                 pass
 
@@ -89,6 +94,8 @@ class MarketDashboard(ft.Column):
             self._wake[symbol] = asyncio.Event()
             self.page.run_task(self._market_loop, symbol)
         self.page.run_task(self._ticker)
+        for symbol in self._feeds:
+            self.page.run_task(self._news_loop, symbol)
 
     def _on_timeframe(self, card: MarketCard, key: str) -> None:
         symbol = next(s for s, c in self._cards.items() if c is card)
@@ -123,7 +130,11 @@ class MarketDashboard(ft.Column):
         card = self._cards[symbol]
         try:
             await asyncio.to_thread(state.refresh)
-            snap = await asyncio.to_thread(build_snapshot, state)
+            try:
+                self._flow[symbol] = await asyncio.to_thread(state.feed.fetch_flow)
+            except Exception:
+                self._flow[symbol] = None  # order flow is optional
+            snap = await asyncio.to_thread(build_snapshot, state, self._flow.get(symbol), self._news.get(symbol))
             if card.timeframe == state.tf.key:  # user may have switched meanwhile
                 card.show(snap)
             self._maybe_alert(snap)
@@ -138,6 +149,18 @@ class MarketDashboard(ft.Column):
             self._last_save = time.time()
             for s in list(self._states.values()):
                 await asyncio.to_thread(s.save_cache)
+
+    async def _news_loop(self, symbol: str) -> None:
+        card = self._cards[symbol]
+        while True:
+            try:
+                summary = await asyncio.to_thread(fetch_news, symbol)
+                self._news[symbol] = summary
+                card.show_news(summary)
+            except Exception as exc:
+                card.show_news_error(_friendly_error(exc))
+            card.update()
+            await asyncio.sleep(NEWS_REFRESH)
 
     async def _ticker(self) -> None:
         while True:
@@ -156,6 +179,7 @@ class MarketDashboard(ft.Column):
     # --------------------------------------------------------------- alerts
     def _maybe_alert(self, snap) -> None:
         """Alert only on signals confirmed by a closed candle, so they never repaint."""
+        self._maybe_alert_reversal(snap)
         symbol = (snap.feed.symbol, snap.tf.key)
         signal = snap.confirmed.signal
         previous = self._last_alert.get(symbol)
@@ -170,6 +194,24 @@ class MarketDashboard(ft.Column):
                     duration=ft.Duration(seconds=8),
                 )
             )
+
+
+    def _maybe_alert_reversal(self, snap) -> None:
+        """Reversal alerts fire the moment the live price breaks the trigger level."""
+        key = (snap.feed.symbol, snap.tf.key)
+        rev = snap.reversal
+        previous = self._last_reversal.get(key)
+        self._last_reversal[key] = rev.stage
+        if previous is None or rev.stage != "TRIGGER" or previous == "TRIGGER" or snap.status == "CLOSED":
+            return
+        word = "NAIK" if rev.direction > 0 else "TURUN"
+        self.page.show_dialog(
+            ft.SnackBar(
+                ft.Text(f"{snap.feed.label} {snap.tf.key}: potensi balik arah {word} — tembus {rev.trigger:,.2f} (skor {rev.score})", color=BG),
+                bgcolor=signal_color("BUY" if rev.direction > 0 else "SELL"),
+                duration=ft.Duration(seconds=10),
+            )
+        )
 
 
 def _friendly_error(exc: Exception) -> str:

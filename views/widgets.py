@@ -138,16 +138,27 @@ class MarketCard(ft.Container):
             ],
             spacing=4,
         )
+        def small_btn(icon, tip, handler):
+            return ft.IconButton(icon, icon_size=16, icon_color=MUTED, tooltip=tip, on_click=handler,
+                                 style=ft.ButtonStyle(padding=4), width=30, height=30)
+
+        self._reset_btn = small_btn(ft.Icons.RESTART_ALT, "Reset zoom", lambda e: self._chart.reset_view())
+        self._reset_btn.disabled = True  # stays in place so the +/- buttons never shift
+        self._chart.on_view_change = self._on_chart_view
         legend = ft.Row(
             [
                 ft.Container(width=12, height=3, bgcolor=EMA20_COLOR, border_radius=2),
                 ft.Text("EMA20", size=11, color=MUTED),
                 ft.Container(width=12, height=3, bgcolor=EMA50_COLOR, border_radius=2),
                 ft.Text("EMA50", size=11, color=MUTED),
-                ft.Container(expand=True),
                 self._chart_hint,
+                ft.Container(expand=True),
+                small_btn(ft.Icons.ZOOM_OUT, "Perkecil (lebih banyak candle)", lambda e: self._chart.zoom(1.4)),
+                small_btn(ft.Icons.ZOOM_IN, "Perbesar", lambda e: self._chart.zoom(1 / 1.4)),
+                self._reset_btn,
             ],
             spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         self._chart_block = ft.Column([toolbar, self._chart, legend], spacing=6)
 
@@ -169,6 +180,57 @@ class MarketCard(ft.Container):
             border_radius=12,
             bgcolor=CARD_ALT,
             border=ft.Border.all(1, BORDER),
+        )
+
+        self._rev_badge = ft.Container()
+        self._rev_note = ft.Text("", size=12, color=TEXT)
+        self._rev_bar = ft.ProgressBar(value=0, bar_height=6, border_radius=3, bgcolor=BORDER, color=MUTED)
+        self._rev_trigger = ft.Text("-", size=13, weight=ft.FontWeight.W_600, color=TEXT)
+        self._rev_invalid = ft.Text("-", size=13, weight=ft.FontWeight.W_600, color=MUTED)
+        self._rev_flow = ft.Text("", size=11, color=MUTED)
+        self._rev_factors = ft.Column(spacing=4)
+        self._rev_levels = ft.Row(
+            [
+                ft.Column([ft.Text("Pemicu (tembus)", size=11, color=MUTED), self._rev_trigger], spacing=2, expand=1),
+                ft.Column([ft.Text("Batal jika lewat", size=11, color=MUTED), self._rev_invalid], spacing=2, expand=1),
+            ]
+        )
+        self._rev_box = ft.Container(
+            ft.Column(
+                [
+                    ft.Row([ft.Text("Potensi balik arah", size=13, weight=ft.FontWeight.W_600, color=TEXT), self._rev_badge],
+                           alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                    self._rev_note,
+                    self._rev_bar,
+                    self._rev_levels,
+                    self._rev_factors,
+                    self._rev_flow,
+                    ft.Text(
+                        "Skor = jumlah kondisi pembalikan yang terpenuhi, bukan peluang pasti. "
+                        "Uji historis BTC (lapisan candle): belum terbukti lebih akurat dari kebetulan.",
+                        size=10,
+                        color=MUTED,
+                        italic=True,
+                    ),
+                ],
+                spacing=8,
+            ),
+            padding=14,
+            border_radius=12,
+            border=ft.Border.all(1, BORDER),
+        )
+
+        self._news_summary = ft.Text("Memuat berita…", size=11, color=MUTED)
+        self._news_list = ft.Column(spacing=10)
+        self._news = ft.ExpansionTile(
+            title=ft.Text("Berita & sentimen", size=13, color=TEXT),
+            subtitle=self._news_summary,
+            controls=[ft.Container(self._news_list, padding=ft.Padding.only(left=4, right=4, bottom=8))],
+            tile_padding=ft.Padding.symmetric(horizontal=4),
+            icon_color=MUTED,
+            collapsed_icon_color=MUTED,
+            shape=ft.RoundedRectangleBorder(radius=10),
+            collapsed_shape=ft.RoundedRectangleBorder(radius=10),
         )
 
         rsi_box, self._rsi, _ = stat("RSI 14")
@@ -234,10 +296,12 @@ class MarketCard(ft.Container):
                     ft.Row([self._price, self._change], vertical_alignment=ft.CrossAxisAlignment.END, spacing=10, wrap=True),
                     self._chart_block,
                     self._signal_box,
+                    self._rev_box,
                     ft.Row([rsi_box, adx_box], spacing=8),
                     ft.Row([atr_box, trend_box], spacing=8),
                     self._levels,
                     self._reasons,
+                    self._news,
                     self._error,
                     self._footer,
                 ],
@@ -268,7 +332,13 @@ class MarketCard(ft.Container):
         up = snap.change_24h >= 0
         self._change.value = f"{'▲' if up else '▼'} {abs(snap.change_24h):.2f}%  24j"
         self._change.color = GREEN if up else RED
+        rev = snap.reversal
+        markers = []
+        if rev.stage != "NONE" and rev.trigger is not None:
+            markers = [(rev.trigger, BLUE, "Pemicu"), (rev.invalidation, MUTED, "Batal")]
+        self._chart.set_markers(markers)
         self._chart.set_data(snap.chart, snap.ema20, snap.ema50, snap.price, snap.tf.seconds)
+        self._show_reversal(snap)
         self._chart_hint.value = f"Timeframe {tf_label(snap.tf.key)}"
         self._atr_caption.value = f"ATR {tf_label(snap.tf.key)}"
         self._trend_caption.value = f"Tren {tf_label(live.htf)}"
@@ -326,6 +396,105 @@ class MarketCard(ft.Container):
             )
         self._factors.controls = rows
         self.tick()
+
+    def _show_reversal(self, snap: Snapshot) -> None:
+        rev = snap.reversal
+        up = rev.direction > 0
+        dir_color = GREEN if up else RED
+        stage_label = {"NONE": ("TIDAK ADA", MUTED), "WATCH": ("PANTAU", AMBER), "SETUP": ("SIAP", BLUE), "TRIGGER": ("TERPICU", dir_color)}
+        text, color = stage_label[rev.stage]
+        if rev.direction and rev.stage != "NONE":
+            text = f"{text} {'▲' if up else '▼'}"
+        self._rev_badge.content = badge(text, color)
+        self._rev_note.value = rev.note
+        self._rev_bar.value = rev.score / 100
+        self._rev_bar.color = color
+        self._rev_levels.visible = rev.stage != "NONE" and rev.trigger is not None
+        if rev.trigger is not None:
+            self._rev_trigger.value = fmt_price(rev.trigger)
+            self._rev_invalid.value = fmt_price(rev.invalidation)
+        self._rev_box.border = ft.Border.all(1, ft.Colors.with_opacity(0.6, color) if rev.stage in ("SETUP", "TRIGGER") else BORDER)
+        rows = []
+        for f in rev.factors:
+            c = GREEN if f.points > 0 else RED
+            rows.append(
+                ft.Row(
+                    [
+                        ft.Text(f"{f.points:+d}", size=11, weight=ft.FontWeight.BOLD, color=c, width=28),
+                        ft.Text(f"{f.group}: {f.detail}", size=11, color=TEXT, expand=True),
+                    ],
+                    spacing=6,
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                )
+            )
+        self._rev_factors.controls = rows
+        flow = snap.flow
+        if flow is not None:
+            self._rev_flow.value = (
+                f"Order flow ±{flow.window:.0f} dtk: taker beli {flow.buy_ratio:.0%} "
+                f"(paruh terbaru {flow.buy_ratio_recent:.0%}) · bid/ask {flow.imbalance:.2f}×"
+            )
+        else:
+            self._rev_flow.value = "Order flow tidak tersedia untuk sumber ini (Yahoo), hanya candle + berita."
+
+    def show_news(self, news) -> None:
+        def tone(v: float) -> tuple[str, str]:
+            if v >= 0.15:
+                return "positif", GREEN
+            if v <= -0.15:
+                return "negatif", RED
+            return "netral", MUTED
+
+        word, color = tone(news.score)
+        sources = sorted({h.source for h in news.headlines})
+        self._news_summary.value = (
+            f"Sentimen {news.score:+.2f} ({word}) · 3 jam terakhir {news.recent:+.2f} · {len(news.headlines)} berita"
+        )
+        self._news_summary.color = color
+        items = []
+        now = time.time()
+        for h in news.headlines[:10]:
+            _, c = tone(h.sentiment)
+            items.append(
+                ft.Container(
+                    ft.Row(
+                        [
+                            ft.Container(width=4, height=34, bgcolor=c, border_radius=2),
+                            ft.Column(
+                                [
+                                    ft.Text(h.title, size=12, color=TEXT, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
+                                    ft.Text(f"{h.source} · {ago(now - h.published)} · {h.sentiment:+.2f}", size=10, color=MUTED),
+                                ],
+                                spacing=2,
+                                expand=True,
+                            ),
+                        ],
+                        spacing=10,
+                    ),
+                    url=h.url,
+                    ink=True,
+                    border_radius=6,
+                )
+            )
+        items.append(
+            ft.Text(
+                "Sumber: " + ", ".join(sources) + ". Sentimen dibaca dari judul berita (kata kunci), bukan isi artikel.",
+                size=10,
+                color=MUTED,
+                italic=True,
+            )
+        )
+        self._news_list.controls = items
+
+    def show_news_error(self, message: str) -> None:
+        self._news_summary.value = f"Berita gagal dimuat: {message}"
+        self._news_summary.color = AMBER
+
+    def _on_chart_view(self, zoomed: bool) -> None:
+        if self._reset_btn.disabled == zoomed:
+            self._reset_btn.disabled = not zoomed
+            self._reset_btn.icon_color = BLUE if zoomed else MUTED
+            self._reset_btn.update()
 
     # --------------------------------------------------------------- toolbar
     def _paint_toolbar(self) -> None:

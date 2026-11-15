@@ -64,12 +64,16 @@ def _ssl_context() -> ssl.SSLContext:
 _SSL = _ssl_context()
 
 
-def _get_json(url: str, timeout: float = 8.0):
+def _get_text(url: str, timeout: float = 8.0) -> str:
     with urlopen(Request(url, headers=_HEADERS), timeout=timeout, context=_SSL) as resp:
         raw = resp.read()
         if resp.headers.get("Content-Encoding") == "gzip":
             raw = gzip.decompress(raw)
-    return json.loads(raw.decode("utf-8"))
+    return raw.decode("utf-8", errors="replace")
+
+
+def _get_json(url: str, timeout: float = 8.0):
+    return json.loads(_get_text(url, timeout))
 
 
 @dataclass(frozen=True)
@@ -100,6 +104,19 @@ def resample(candles: list[Candle], seconds: int) -> list[Candle]:
 
 
 @dataclass(frozen=True)
+class OrderFlow:
+    """Aggressor flow over the last ~60s of trades plus order-book imbalance."""
+
+    window: float  # seconds covered by the trades
+    buy_ratio: float  # taker-buy volume / total volume, 0..1
+    buy_ratio_recent: float  # newer half of the window
+    buy_ratio_prev: float  # older half of the window
+    imbalance: float  # bid qty / ask qty within 0.25% of mid price
+    trades: int
+    time: float
+
+
+@dataclass(frozen=True)
 class Quote:
     price: float
     time: float  # epoch seconds of the last trade/quote
@@ -122,6 +139,10 @@ class Feed:
         """Seconds of history an incremental request safely covers."""
         raise NotImplementedError
 
+    def fetch_flow(self) -> OrderFlow | None:
+        """Order-flow snapshot, or None when the venue does not publish it."""
+        return None
+
 
 class BinanceFeed(Feed):
     """Binance spot klines: real-time, the forming candle carries live volume."""
@@ -140,18 +161,50 @@ class BinanceFeed(Feed):
     def recent_window(self, tf: Timeframe) -> float:
         return tf.seconds * 2  # limit=3 -> current + 2 previous candles
 
-    def fetch(self, tf: Timeframe, full: bool) -> tuple[list[Candle], Quote]:
-        query = urlencode({"symbol": self.symbol, "interval": tf.key, "limit": 1000 if full else 3})
+    def _get(self, path: str):
         last_error: Exception | None = None
         for host in (self._host, *[h for h in self.HOSTS if h != self._host]):
             try:
-                rows = _get_json(f"{host}/api/v3/klines?{query}")
+                data = _get_json(f"{host}{path}")
                 self._host = host
-                break
+                return data
             except Exception as exc:  # try the next mirror
                 last_error = exc
-        else:
-            raise ConnectionError(f"Binance tidak dapat dihubungi: {last_error}")
+        raise ConnectionError(f"Binance tidak dapat dihubungi: {last_error}")
+
+    def fetch_flow(self) -> OrderFlow:
+        trades = self._get(f"/api/v3/aggTrades?symbol={self.symbol}&limit=1000")
+        book = self._get(f"/api/v3/depth?symbol={self.symbol}&limit=100")
+        end = trades[-1]["T"] / 1000
+        start = trades[0]["T"] / 1000
+        mid_t = (start + end) / 2
+
+        def ratio(rows) -> float:
+            buy = sum(float(r["q"]) for r in rows if not r["m"])  # m=True: buyer was maker -> taker sold
+            total = sum(float(r["q"]) for r in rows)
+            return buy / total if total else 0.5
+
+        recent = [r for r in trades if r["T"] / 1000 >= mid_t]
+        older = [r for r in trades if r["T"] / 1000 < mid_t]
+        best_bid = float(book["bids"][0][0])
+        best_ask = float(book["asks"][0][0])
+        mid = (best_bid + best_ask) / 2
+        band = mid * 0.0025
+        bids = sum(float(q) for p, q in book["bids"] if float(p) >= mid - band)
+        asks = sum(float(q) for p, q in book["asks"] if float(p) <= mid + band)
+        return OrderFlow(
+            window=end - start,
+            buy_ratio=ratio(trades),
+            buy_ratio_recent=ratio(recent),
+            buy_ratio_prev=ratio(older),
+            imbalance=bids / asks if asks else 1.0,
+            trades=len(trades),
+            time=time.time(),
+        )
+
+    def fetch(self, tf: Timeframe, full: bool) -> tuple[list[Candle], Quote]:
+        query = urlencode({"symbol": self.symbol, "interval": tf.key, "limit": 1000 if full else 3})
+        rows = self._get(f"/api/v3/klines?{query}")
 
         candles = [
             Candle(int(r[0]) // 1000, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
